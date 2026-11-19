@@ -351,7 +351,9 @@ public sealed class BmrDecoder
                 if (value == previous)
                 {
                     var countByte = ReadRleByte();
-                    var count = countByte;
+
+                    // 必須明確宣告為 int，因為後續可能讀取兩位元組計數值。
+                    var count = (int)countByte;
 
                     if ((countByte & 0x80) != 0)
                     {
