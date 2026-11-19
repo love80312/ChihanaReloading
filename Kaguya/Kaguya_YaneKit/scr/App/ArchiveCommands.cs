@@ -9,7 +9,7 @@ public static class ArchiveCommands
 {
     public static int Unpack(string[] args, KaguyaRuntimeContext? context = null)
     {
-        if (args.Length < 2 || args.Length > 5 || !ValidateUnpackOptions(args))
+        if (args.Length < 2 || !ValidateUnpackOptions(args))
         {
             PrintHelp();
             return 1;
@@ -19,6 +19,7 @@ public static class ArchiveCommands
         {
             var archivePath = args[0];
             var outputDirectory = args[1];
+            var overwriteExisting = HasFlag(args, "--overwrite");
             var magic = ReadMagic(archivePath);
             if (magic.StartsWith("AF01", StringComparison.Ordinal))
             {
@@ -27,7 +28,10 @@ public static class ArchiveCommands
                 var manifest = codec.ReadManifest(stream);
                 PrintAf01Info(manifest);
                 var stopwatch = Stopwatch.StartNew();
-                codec.Extract(archivePath, outputDirectory);
+                codec.Extract(
+                    archivePath,
+                    outputDirectory,
+                    overwriteExisting: overwriteExisting);
                 Console.WriteLine($"Extracted {manifest.Entries.Count} AF01 entries to {outputDirectory} in {stopwatch.Elapsed.TotalSeconds:F2}s");
                 Console.WriteLine($"Wrote {Path.Combine(outputDirectory, Af01ArchiveCodec.ManifestFileName)}");
                 return 0;
@@ -42,7 +46,13 @@ public static class ArchiveCommands
                 var manifest = codec.ReadManifest(stream);
                 PrintLinkInfo(manifest);
                 var stopwatch = Stopwatch.StartNew();
-                codec.Extract(archivePath, outputDirectory, paramsPath ?? context?.ParamsPath, context?.LinkEncryptionKey, decrypt);
+                codec.Extract(
+                    archivePath,
+                    outputDirectory,
+                    paramsPath ?? context?.ParamsPath,
+                    context?.LinkEncryptionKey,
+                    decrypt,
+                    overwriteExisting: overwriteExisting);
                 Console.WriteLine($"Extracted {manifest.Entries.Count} LINK entries to {outputDirectory} in {stopwatch.Elapsed.TotalSeconds:F2}s");
                 Console.WriteLine($"Wrote {Path.Combine(outputDirectory, "_link_manifest.json")}");
                 return 0;
@@ -174,7 +184,8 @@ public static class ArchiveCommands
         for (var i = 2; i < args.Length; i++)
         {
             if (string.Equals(args[i], "--no-decrypt", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(args[i], "--raw", StringComparison.OrdinalIgnoreCase))
+                string.Equals(args[i], "--raw", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(args[i], "--overwrite", StringComparison.OrdinalIgnoreCase))
             {
                 continue;
             }
@@ -253,7 +264,7 @@ public static class ArchiveCommands
     private static void PrintHelp()
     {
         Console.WriteLine("archive commands:");
-        Console.WriteLine("  archive_unpack <archive.arc> <output-dir> [--params params.dat] [--no-decrypt|--raw]");
+        Console.WriteLine("  archive_unpack <archive.arc> <output-dir> [--params params.dat] [--no-decrypt|--raw] [--overwrite]");
         Console.WriteLine("  archive_pack <input-dir> <manifest.json> <output.arc> [--compress|--no-compress] [--encrypt|--no-encrypt] [--params params.dat]");
     }
 
