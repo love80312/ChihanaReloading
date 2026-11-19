@@ -5,7 +5,7 @@
 // 调度流程:
 //   1. 解析全局选项 (--game-root, --workdir, --params)
 //   2. 无子命令时进入 InteractiveSession 交互模式
-//   3. 有子命令时创建 KaguyaRuntimeContext 并路由到对应 Commands 类
+//   3. 只有依赖游戏运行时上下文的命令才创建 KaguyaRuntimeContext
 //
 // 子命令路由表:
 //   scr       -> ScrCommands         (脚本 HLS 高级解析/回编，低级 SCRASM 调试/校验)
@@ -17,7 +17,6 @@
 //
 // 依赖: KaguyaRuntimeContext, InteractiveSession, 各 Commands 类
 // ============================================================================
-
 namespace Kaguya_YaneKit.App;
 
 public static class KaguyaApp
@@ -32,12 +31,19 @@ public static class KaguyaApp
             return new InteractiveSession().Run();
         }
 
+        var command = args[0].Trim().ToLowerInvariant();
         KaguyaRuntimeContext? context = null;
-        if (!IsHelp(args))
+
+        // msg / tblstr / tbl / params / pe / help / self-test 不依賴遊戲執行環境。
+        // 避免它們因目前工作目錄中存在不相容的 params.dat 而被無關錯誤阻擋。
+        if (!IsHelp(args) && RequiresRuntimeContext(command))
         {
             try
             {
-                context = KaguyaRuntimeContext.Create(startup.GameRoot, startup.WorkDirectory, startup.ParamsPath);
+                context = KaguyaRuntimeContext.Create(
+                    startup.GameRoot,
+                    startup.WorkDirectory,
+                    startup.ParamsPath);
             }
             catch (Exception ex)
             {
@@ -46,42 +52,64 @@ public static class KaguyaApp
             }
         }
 
-        switch (args[0].Trim().ToLowerInvariant())
+        switch (command)
         {
             case "--help":
             case "-h":
                 PrintHelp();
                 return 0;
+
             case "--self-test":
                 Console.WriteLine("Self-test stub: core scaffolding is present.");
                 return 0;
+
             case "scr":
                 return ScrCommands.Run(args.Skip(1).ToArray(), context);
+
             case "msg":
                 return MessageCommands.Run(args.Skip(1).ToArray());
+
             case "tblstr":
                 return TblstrCommands.Run(args.Skip(1).ToArray());
+
             case "tbl":
                 return TblCommands.Run(args.Skip(1).ToArray());
+
             case "params":
                 return ParamsCommands.Run(args.Skip(1).ToArray());
+
             case "pic":
                 return PictureCommands.Run(args.Skip(1).ToArray(), context);
+
             case "character":
                 return CharacterCommands.Run(args.Skip(1).ToArray(), context);
+
             case "link":
                 return LinkCommands.Run(args.Skip(1).ToArray(), context);
+
             case "pe":
                 return PeCommands.Run(args.Skip(1).ToArray());
+
             case "archive_unpack":
                 return ArchiveCommands.Unpack(args.Skip(1).ToArray(), context);
+
             case "archive_pack":
                 return ArchiveCommands.Pack(args.Skip(1).ToArray(), context);
+
             default:
                 Console.WriteLine($"Unknown command: {args[0]}");
                 return 1;
         }
     }
+
+    private static bool RequiresRuntimeContext(string command) =>
+        command is
+            "scr" or
+            "pic" or
+            "character" or
+            "link" or
+            "archive_unpack" or
+            "archive_pack";
 
     private static bool IsHelp(string[] args) =>
         args.Length == 0 ||
@@ -197,9 +225,11 @@ public static class KaguyaApp
             string? workDirectory = null;
             string? paramsPath = null;
             var index = 0;
+
             while (index < args.Length)
             {
                 var arg = args[index];
+
                 if (!IsGlobalOption(arg))
                 {
                     break;
@@ -211,14 +241,17 @@ public static class KaguyaApp
                 }
 
                 var value = args[index + 1];
+
                 switch (arg.ToLowerInvariant())
                 {
                     case "--game-root":
                         gameRoot = value;
                         break;
+
                     case "--workdir":
                         workDirectory = value;
                         break;
+
                     case "--params":
                         paramsPath = value;
                         break;
