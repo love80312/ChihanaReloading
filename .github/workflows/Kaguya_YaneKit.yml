@@ -1,0 +1,121 @@
+
+name: Kaguya_YaneKit EXE Build
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "Kaguya/Kaguya_YaneKit/**"
+      - ".github/workflows/exe.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    env:
+      PROJECT_FILE: Kaguya/Kaguya_YaneKit/Kaguya_YaneKit.csproj
+      PUBLISH_DIR: artifacts/Kaguya_YaneKit
+
+    steps:
+      # 1. 取得原始碼
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # 2. 安裝 .NET 8 SDK
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 8.0.x
+
+      # 3. 還原 NuGet 套件
+      - name: Restore
+        shell: pwsh
+        run: |
+          dotnet restore "$env:PROJECT_FILE" --runtime win-x64
+
+      # 4. 發布 Windows x64 單檔 EXE
+      - name: Publish
+        shell: pwsh
+        run: |
+          dotnet publish "$env:PROJECT_FILE" `
+            --configuration Release `
+            --runtime win-x64 `
+            --self-contained true `
+            --no-restore `
+            --output "$env:PUBLISH_DIR" `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:UseAppHost=true `
+            -p:DebugType=None `
+            -p:DebugSymbols=false
+
+      # 5. 複製必要設定檔
+      - name: Copy Configuration Files
+        shell: pwsh
+        run: |
+          $projectDir = Split-Path -Parent $env:PROJECT_FILE
+
+          $sourceIni = Join-Path $projectDir "ini"
+          $targetIni = Join-Path $env:PUBLISH_DIR "ini"
+
+          if (-not (Test-Path -LiteralPath $sourceIni -PathType Container)) {
+              throw "Missing configuration directory: $sourceIni"
+          }
+
+          New-Item -ItemType Directory -Path $targetIni -Force | Out-Null
+
+          Copy-Item `
+            -Path (Join-Path $sourceIni "*") `
+            -Destination $targetIni `
+            -Recurse `
+            -Force
+
+          # 確認必要設定檔
+          $requiredConfigs = @(
+              "message_config.ini",
+              "tblstr_config.ini"
+          )
+
+          foreach ($config in $requiredConfigs) {
+              $configPath = Join-Path $targetIni $config
+
+              if (-not (Test-Path -LiteralPath $configPath)) {
+                  throw "Missing required configuration: $config"
+              }
+
+              Write-Host "Verified: $config"
+          }
+
+      # 6. 執行基本啟動測試
+      - name: Smoke Test
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:PUBLISH_DIR "Kaguya_YaneKit.exe"
+
+          if (-not (Test-Path -LiteralPath $exe)) {
+              throw "Executable not found: $exe"
+          }
+
+          & $exe --self-test
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Self-test failed with exit code: $LASTEXITCODE"
+          }
+
+          Write-Host "Executable startup test passed."
+
+      # 7. 上傳編譯產物
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Kaguya_YaneKit-Windows-x64
+          path: artifacts/Kaguya_YaneKit/
+          if-no-files-found: error
