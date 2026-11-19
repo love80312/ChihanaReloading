@@ -1,23 +1,11 @@
 // ============================================================================
 // MessageDatCodec.cs
-// message.dat 二进制编解码器
+// message.dat 二進位編解碼器
 //
-// 文件格式 (ver4.0):
-//   [Magic]    "[SCR-MESSAGE]ver4.0" + 加密标志(bool) + XOR 密钥(byte)
-//   [Names]    角色名列表 (u32 count + u16 length + bytes per entry)
-//   [Choices]  选项文本列表 (同上格式)
-//   [Messages] 消息条目列表 (i32 blockLen + 加密块: i32 textLen + text + u8 voiceCount + null-terminated UTF-16 voices)
-//   [Commands] 命令列表 (i32 id + u8 paramCount + i32 per param)
-//   [RawTail]  尾部原始数据 (原样保留)
-//
-// 核心算法:
-//   XOR 加密 - 当 Encrypted=true 时, 字符串字节和消息块与 XorKey 逐字节异或
-//   编码转换 - 读取时用 _readEncoding, 写入时用 _writeEncoding (支持 cp932/GBK/UTF-8 等)
-//   往返保真 - TryUseRawBytes() 在文本未变时优先使用原始字节, 避免编码差异
-//   占位符处理 - 通过 MessagePlaceholderConfig 在字节与占位符文本之间双向转换
-//
-// 依赖: MessagePlaceholderConfig, MessageDatDocument, MessageEntry, MessageCommand
-// 被依赖: InteractiveSession (CLI 主流程)
+// 核心原則:
+//   - 保留原始位元組，未修改文字時優先使用原始資料
+//   - 讀取所有長度欄位時確認資料完整，避免截斷資料被當成有效內容
+//   - 不設定任意固定檔案大小上限，避免排除合法的大型遊戲資源
 // ============================================================================
 using System.Text;
 using Kaguya_YaneKit.Text.MessageDat.Model;
@@ -45,12 +33,14 @@ public sealed class MessageDatCodec
         using var stream = new MemoryStream(source.ToArray(), writable: false);
         using var reader = new BinaryReader(stream, Encoding.ASCII, leaveOpen: false);
 
-        var magicBytes = reader.ReadBytes(MessageDatDocument.Magic.Length);
+        var magicBytes = ReadExact(reader, MessageDatDocument.Magic.Length, "message.dat magic");
         var magic = Encoding.ASCII.GetString(magicBytes);
-        if (magic != MessageDatDocument.Magic)
+        if (!string.Equals(magic, MessageDatDocument.Magic, StringComparison.Ordinal))
         {
             throw new InvalidDataException($"Invalid message.dat magic: {magic}");
         }
+
+        EnsureRemaining(stream, 2, "message.dat header");
 
         var document = new MessageDatDocument
         {
@@ -61,30 +51,36 @@ public sealed class MessageDatCodec
         ReadStringList(reader, document.Names, document.RawNameBytes, document);
         ReadStringList(reader, document.Choices, document.RawChoiceBytes, document);
 
-        var messageCount = reader.ReadInt32();
+        var messageCount = ReadCount(reader, "message", minimumBytesPerItem: sizeof(int));
         for (var i = 0; i < messageCount; i++)
         {
             document.Messages.Add(ReadMessage(reader, document));
         }
 
-        var commandCount = reader.ReadInt32();
+        var commandCount = ReadCount(reader, "command", minimumBytesPerItem: sizeof(int) + sizeof(byte));
         for (var i = 0; i < commandCount; i++)
         {
             document.Commands.Add(ReadCommand(reader));
         }
 
         var remaining = checked((int)(stream.Length - stream.Position));
-        document.RawTail = remaining > 0 ? reader.ReadBytes(remaining) : [];
+        document.RawTail = remaining > 0
+            ? ReadExact(reader, remaining, "message.dat raw tail")
+            : [];
+
         return document;
     }
 
     public byte[] Write(MessageDatDocument document, bool? encrypted = null, byte? xorKey = null)
     {
+        ArgumentNullException.ThrowIfNull(document);
+
         document.Encrypted = encrypted ?? document.Encrypted;
         document.XorKey = xorKey ?? document.XorKey;
 
         using var stream = new MemoryStream();
         using var writer = new BinaryWriter(stream, Encoding.ASCII, leaveOpen: true);
+
         writer.Write(Encoding.ASCII.GetBytes(MessageDatDocument.Magic));
         writer.Write(document.Encrypted);
         writer.Write(document.XorKey);
@@ -131,26 +127,40 @@ public sealed class MessageDatCodec
         };
     }
 
-    private void ReadStringList(BinaryReader reader, List<string> target, List<byte[]> rawTarget, MessageDatDocument document)
+    private void ReadStringList(
+        BinaryReader reader,
+        List<string> target,
+        List<byte[]> rawTarget,
+        MessageDatDocument document)
     {
-        var count = reader.ReadInt32();
+        var count = ReadCount(reader, "string list", minimumBytesPerItem: sizeof(ushort));
+
         for (var i = 0; i < count; i++)
         {
+            EnsureRemaining(reader.BaseStream, sizeof(ushort), "string length");
             var length = reader.ReadUInt16();
-            var bytes = reader.ReadBytes(length);
+            var bytes = ReadExact(reader, length, $"string entry {i}");
             XorIfNeeded(bytes, document);
+
             rawTarget.Add(bytes.ToArray());
             target.Add(_placeholders.Decode(bytes, _readEncoding));
         }
     }
 
-    private void WriteStringList(BinaryWriter writer, IReadOnlyList<string> values, IReadOnlyList<byte[]> rawValues, MessageDatDocument document)
+    private void WriteStringList(
+        BinaryWriter writer,
+        IReadOnlyList<string> values,
+        IReadOnlyList<byte[]> rawValues,
+        MessageDatDocument document)
     {
         writer.Write(values.Count);
+
         for (var i = 0; i < values.Count; i++)
         {
             var value = values[i];
-            var bytes = TryUseRawBytes(rawValues, i, value) ?? _placeholders.Encode(value, _writeEncoding);
+            var bytes = TryUseRawBytes(rawValues, i, value)
+                ?? _placeholders.Encode(value, _writeEncoding);
+
             if (bytes.Length > ushort.MaxValue)
             {
                 throw new InvalidDataException("message.dat string entry is too large.");
@@ -164,16 +174,30 @@ public sealed class MessageDatCodec
 
     private MessageEntry ReadMessage(BinaryReader reader, MessageDatDocument document)
     {
+        EnsureRemaining(reader.BaseStream, sizeof(int), "message block length");
         var blockLength = reader.ReadInt32();
-        var block = reader.ReadBytes(blockLength);
+
+        if (blockLength < sizeof(int) + sizeof(byte))
+        {
+            throw new InvalidDataException($"Invalid message block length: {blockLength}");
+        }
+
+        var block = ReadExact(reader, blockLength, "message block");
         XorIfNeeded(block, document);
 
         using var stream = new MemoryStream(block, writable: false);
         using var blockReader = new BinaryReader(stream, Encoding.Unicode, leaveOpen: false);
         var message = new MessageEntry();
 
+        EnsureRemaining(stream, sizeof(int), "message text length");
         var textLength = blockReader.ReadInt32();
-        var textBytes = blockReader.ReadBytes(textLength);
+
+        if (textLength < 0 || (long)textLength + sizeof(byte) > stream.Length - stream.Position)
+        {
+            throw new InvalidDataException($"Invalid message text length: {textLength}");
+        }
+
+        var textBytes = ReadExact(blockReader, textLength, "message text");
         message.Text = _placeholders.Decode(textBytes, _readEncoding);
         message.RawTextBytes = textBytes.ToArray();
 
@@ -194,9 +218,12 @@ public sealed class MessageDatCodec
     private void WriteMessage(BinaryWriter writer, MessageEntry message, MessageDatDocument document)
     {
         using var stream = new MemoryStream();
+
         using (var blockWriter = new BinaryWriter(stream, Encoding.Unicode, leaveOpen: true))
         {
-            var textBytes = TryUseRawBytes(message.RawTextBytes, message.Text) ?? _placeholders.Encode(message.Text, _writeEncoding);
+            var textBytes = TryUseRawBytes(message.RawTextBytes, message.Text)
+                ?? _placeholders.Encode(message.Text, _writeEncoding);
+
             blockWriter.Write(textBytes.Length);
             blockWriter.Write(textBytes);
 
@@ -221,12 +248,16 @@ public sealed class MessageDatCodec
 
     private static MessageCommand ReadCommand(BinaryReader reader)
     {
+        EnsureRemaining(reader.BaseStream, sizeof(int) + sizeof(byte), "message command header");
+
         var command = new MessageCommand
         {
             Id = reader.ReadInt32()
         };
 
         var count = reader.ReadByte();
+        EnsureRemaining(reader.BaseStream, checked(count * sizeof(int)), "message command parameters");
+
         for (var i = 0; i < count; i++)
         {
             command.Params.Add(reader.ReadInt32());
@@ -266,6 +297,7 @@ public sealed class MessageDatCodec
 
         writer.Write(command.Id);
         writer.Write((byte)command.Params.Count);
+
         foreach (var param in command.Params)
         {
             writer.Write(param);
@@ -275,9 +307,12 @@ public sealed class MessageDatCodec
     private static string ReadNullTerminatedUtf16(BinaryReader reader)
     {
         var bytes = new List<byte>();
+
         while (true)
         {
+            EnsureRemaining(reader.BaseStream, sizeof(ushort), "UTF-16 voice terminator");
             var value = reader.ReadUInt16();
+
             if (value == 0)
             {
                 break;
@@ -288,6 +323,53 @@ public sealed class MessageDatCodec
         }
 
         return Encoding.Unicode.GetString(bytes.ToArray());
+    }
+
+    private static int ReadCount(BinaryReader reader, string fieldName, int minimumBytesPerItem)
+    {
+        EnsureRemaining(reader.BaseStream, sizeof(int), $"{fieldName} count");
+        var count = reader.ReadInt32();
+
+        if (count < 0)
+        {
+            throw new InvalidDataException($"Negative {fieldName} count: {count}");
+        }
+
+        var remaining = reader.BaseStream.Length - reader.BaseStream.Position;
+        if (minimumBytesPerItem > 0 && count > remaining / minimumBytesPerItem)
+        {
+            throw new InvalidDataException(
+                $"Invalid {fieldName} count: {count}; remaining data is too short.");
+        }
+
+        return count;
+    }
+
+    private static byte[] ReadExact(BinaryReader reader, int count, string fieldName)
+    {
+        if (count < 0)
+        {
+            throw new InvalidDataException($"Negative length for {fieldName}: {count}");
+        }
+
+        EnsureRemaining(reader.BaseStream, count, fieldName);
+
+        var bytes = reader.ReadBytes(count);
+        if (bytes.Length != count)
+        {
+            throw new EndOfStreamException(
+                $"Unexpected end of file while reading {fieldName}: expected {count} bytes, got {bytes.Length}.");
+        }
+
+        return bytes;
+    }
+
+    private static void EnsureRemaining(Stream stream, long requiredBytes, string fieldName)
+    {
+        if (requiredBytes < 0 || requiredBytes > stream.Length - stream.Position)
+        {
+            throw new EndOfStreamException($"Truncated message.dat while reading {fieldName}.");
+        }
     }
 
     private static void XorIfNeeded(byte[] bytes, MessageDatDocument document)
