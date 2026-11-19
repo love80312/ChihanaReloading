@@ -11,26 +11,11 @@
 //
 // 解压流程 (Unpack):
 //   1. UnpackHuffman    -- 从偏移 0x14 开始, MSB-first 位流读取
-//      - CreateHuffmanTree: 递归构建二叉树 (bit=1 -> 内部节点, bit=0 -> 8-bit 叶)
-//      - 逐符号遍历树解码, 输出 unpackedSize 字节
-//
 //   2. UndoMoveToFront  -- Move-To-Front 逆变换
-//      - 维护 256 字节字典, 输入值为字典索引
-//      - 取出对应字节, 将其移到字典头部, 恢复原始字节值
-//
-//   3. Decode (BWT 逆变换) -- Burrows-Wheeler 逆变换
-//      - 统计字节频率 -> 前缀和 -> 分布表
-//      - 从 key 位置开始沿分布表链式遍历, 恢复原始序列
-//
+//   3. Decode           -- BWT 逆变换
 //   4. DecompressRLE    -- 步进式 RLE 解压 (仅当 step != 0)
-//      - 以 step 为步长交错填充 result[]
-//      - 连续重复字节用 1~2 字节计数编码:
-//        count < 128 -> 1 字节; count >= 128 -> 2 字节 (高位标记 + 低位扩展)
 //
 // 位读取器: MsbBitReader -- MSB-first 位流读取, 逐字节填充
-//
-// 依赖: System.Buffers.Binary (小端整数读取)
-// 被依赖: LinkArchiveCodec (压缩条目解包)
 // ============================================================================
 using System.Buffers.Binary;
 
@@ -38,6 +23,10 @@ namespace Kaguya_YaneKit.Formats.Archive;
 
 public sealed class BmrDecoder
 {
+    private const int HeaderSize = 0x14;
+    private const int MaxHuffmanInternalNodes = 255;
+    private const int MaxHuffmanDepth = 255;
+
     private readonly int _step;
     private readonly int _finalSize;
     private readonly int _key;
@@ -47,153 +36,358 @@ public sealed class BmrDecoder
 
     public BmrDecoder(byte[] data)
     {
-        if (data.Length < 0x14)
+        ArgumentNullException.ThrowIfNull(data);
+
+        if (data.Length < HeaderSize)
+        {
             throw new InvalidDataException("BMR data too short.");
+        }
+
         if (data[0] != 'B' || data[1] != 'M' || data[2] != 'R')
+        {
             throw new InvalidDataException("Invalid BMR magic.");
+        }
 
         _step = data[3];
         _finalSize = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(4));
         _key = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(8));
         _unpackedSize = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(12));
         _huffmanSize = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(16));
-        if (_huffmanSize < 0 || 0x14 + _huffmanSize > data.Length)
-            throw new InvalidDataException("BMR Huffman stream size is invalid.");
+
+        if (_finalSize < 0 || _finalSize > Array.MaxLength)
+        {
+            throw new InvalidDataException(
+                $"BMR final output size is invalid: {_finalSize}.");
+        }
+
+        if (_unpackedSize < 0 || _unpackedSize > Array.MaxLength)
+        {
+            throw new InvalidDataException(
+                $"BMR unpacked size is invalid: {_unpackedSize}.");
+        }
+
+        if (_huffmanSize < 0 || _huffmanSize > data.Length - HeaderSize)
+        {
+            throw new InvalidDataException(
+                "BMR Huffman stream size is invalid.");
+        }
+
+        if (_step != 0 && _finalSize > 0 && _step > _finalSize)
+        {
+            throw new InvalidDataException(
+                $"BMR RLE step ({_step}) exceeds final output size ({_finalSize}).");
+        }
+
         _input = data;
     }
 
     public static bool IsBmr(byte[] data) =>
-        data.Length >= 3 && data[0] == 'B' && data[1] == 'M' && data[2] == 'R';
+        data is { Length: >= 3 } &&
+        data[0] == 'B' && data[1] == 'M' && data[2] == 'R';
 
     public byte[] Unpack()
     {
-        var bitReader = new MsbBitReader(_input, 0x14, _huffmanSize);
+        if (_unpackedSize == 0)
+        {
+            if (_step != 0 && _finalSize != 0)
+            {
+                throw new InvalidDataException(
+                    "BMR stream has no Huffman output but requests a non-empty RLE output.");
+            }
+
+            return [];
+        }
+
+        if (_huffmanSize == 0)
+        {
+            throw new InvalidDataException(
+                "BMR Huffman stream is empty.");
+        }
+
+        var bitReader = new MsbBitReader(
+            _input,
+            HeaderSize,
+            _huffmanSize);
+
         var output = UnpackHuffman(bitReader, _unpackedSize);
+
         UndoMoveToFront(output);
         output = Decode(output, _key);
+
         if (_step != 0)
-            output = DecompressRLE(output, _finalSize, _step);
+        {
+            output = DecompressRLE(
+                output,
+                _finalSize,
+                _step);
+        }
+
         return output;
     }
 
-    private static byte[] UnpackHuffman(MsbBitReader reader, int outputSize)
+    private static byte[] UnpackHuffman(
+        MsbBitReader reader,
+        int outputSize)
     {
+        if (outputSize == 0)
+        {
+            return [];
+        }
+
         var output = new byte[outputSize];
+
         ushort token = 256;
         var tree = new ushort[2, 256];
-        var root = CreateHuffmanTree(reader, tree, ref token);
-        for (int dst = 0; dst < output.Length; dst++)
+
+        var root = CreateHuffmanTree(
+            reader,
+            tree,
+            ref token,
+            depth: 0);
+
+        for (var dst = 0; dst < output.Length; dst++)
         {
-            ushort symbol = root;
+            var symbol = root;
+
             while (symbol >= 0x100)
             {
-                int bit = reader.GetNextBit();
+                var nodeIndex = symbol - 256;
+
+                if (nodeIndex >= token - 256)
+                {
+                    throw new InvalidDataException(
+                        "BMR Huffman tree references an undefined node.");
+                }
+
+                var bit = reader.GetNextBit();
+
                 if (bit < 0)
-                    throw new EndOfStreamException("Unexpected end of BMR Huffman stream.");
-                symbol = tree[bit, symbol - 256];
+                {
+                    throw new EndOfStreamException(
+                        "Unexpected end of BMR Huffman stream.");
+                }
+
+                symbol = tree[bit, nodeIndex];
             }
+
             output[dst] = (byte)symbol;
         }
+
         return output;
     }
 
-    private static ushort CreateHuffmanTree(MsbBitReader reader, ushort[,] tree, ref ushort token)
+    private static ushort CreateHuffmanTree(
+        MsbBitReader reader,
+        ushort[,] tree,
+        ref ushort token,
+        int depth)
     {
-        if (reader.GetNextBit() != 0)
+        if (depth > MaxHuffmanDepth)
         {
-            ushort v = token++;
-            tree[0, v - 256] = CreateHuffmanTree(reader, tree, ref token);
-            tree[1, v - 256] = CreateHuffmanTree(reader, tree, ref token);
-            return v;
+            throw new InvalidDataException(
+                "BMR Huffman tree exceeds the maximum depth.");
         }
-        return (ushort)reader.GetBits(8);
+
+        var bit = reader.GetNextBit();
+
+        if (bit < 0)
+        {
+            throw new EndOfStreamException(
+                "Unexpected end of BMR Huffman tree.");
+        }
+
+        if (bit == 0)
+        {
+            return (ushort)reader.GetBits(8);
+        }
+
+        if (token - 256 >= MaxHuffmanInternalNodes)
+        {
+            throw new InvalidDataException(
+                "BMR Huffman tree contains too many internal nodes.");
+        }
+
+        var node = token++;
+        var index = node - 256;
+
+        tree[0, index] = CreateHuffmanTree(
+            reader,
+            tree,
+            ref token,
+            depth + 1);
+
+        tree[1, index] = CreateHuffmanTree(
+            reader,
+            tree,
+            ref token,
+            depth + 1);
+
+        return node;
     }
 
     private static void UndoMoveToFront(byte[] data)
     {
         var dict = new byte[256];
-        for (int i = 0; i < 256; i++)
-            dict[i] = (byte)i;
 
-        for (int i = 0; i < data.Length; i++)
+        for (var i = 0; i < 256; i++)
         {
-            byte v = data[i];
-            data[i] = dict[v];
-            byte saved = dict[v];
-            for (int j = v; j > 0; j--)
+            dict[i] = (byte)i;
+        }
+
+        for (var i = 0; i < data.Length; i++)
+        {
+            var value = data[i];
+            var saved = dict[value];
+
+            data[i] = saved;
+
+            for (var j = value; j > 0; j--)
+            {
                 dict[j] = dict[j - 1];
+            }
+
             dict[0] = saved;
         }
     }
 
     private static byte[] Decode(byte[] input, int key)
     {
-        var freqTable = new int[256];
-        for (int i = 0; i < input.Length; i++)
-            freqTable[input[i]]++;
+        if (input.Length == 0)
+        {
+            if (key != 0)
+            {
+                throw new InvalidDataException(
+                    "BMR BWT key is invalid for an empty input.");
+            }
 
-        for (int i = 1; i < 256; i++)
+            return [];
+        }
+
+        if (key < 0 || key >= input.Length)
+        {
+            throw new InvalidDataException(
+                $"BMR BWT key is outside the decoded buffer: {key}.");
+        }
+
+        var freqTable = new int[256];
+
+        for (var i = 0; i < input.Length; i++)
+        {
+            freqTable[input[i]]++;
+        }
+
+        for (var i = 1; i < 256; i++)
+        {
             freqTable[i] += freqTable[i - 1];
+        }
 
         var distribTable = new int[input.Length];
-        for (int i = input.Length - 1; i >= 0; i--)
+
+        for (var i = input.Length - 1; i >= 0; i--)
         {
-            int v = input[i];
-            int freq = --freqTable[v];
-            distribTable[freq] = i;
+            var value = input[i];
+            var frequency = --freqTable[value];
+
+            distribTable[frequency] = i;
         }
 
-        int pos = key;
+        var position = key;
         var output = new byte[input.Length];
-        for (int i = 0; i < output.Length; i++)
+
+        for (var i = 0; i < output.Length; i++)
         {
-            pos = distribTable[pos];
-            output[i] = input[pos];
+            position = distribTable[position];
+            output[i] = input[position];
         }
+
         return output;
     }
 
-    private static byte[] DecompressRLE(byte[] input, int finalSize, int step)
+    private static byte[] DecompressRLE(
+        byte[] input,
+        int finalSize,
+        int step)
     {
-        var result = new byte[finalSize];
-        int src = 0;
-        for (int i = 0; i < step; i++)
+        if (finalSize == 0)
         {
-            byte v1 = input[src++];
-            result[i] = v1;
-            int dst = i + step;
-            while (dst < result.Length)
+            return [];
+        }
+
+        if (step <= 0 || step > finalSize)
+        {
+            throw new InvalidDataException(
+                $"BMR RLE step is invalid: {step}.");
+        }
+
+        var result = new byte[finalSize];
+        var source = 0;
+
+        byte ReadRleByte()
+        {
+            if ((uint)source >= (uint)input.Length)
             {
-                byte v2 = input[src++];
-                result[dst] = v2;
-                dst += step;
-                if (v2 == v1)
+                throw new EndOfStreamException(
+                    "Unexpected end of BMR RLE data.");
+            }
+
+            return input[source++];
+        }
+
+        for (var lane = 0; lane < step; lane++)
+        {
+            var previous = ReadRleByte();
+
+            result[lane] = previous;
+
+            var destination = lane + step;
+
+            while (destination < result.Length)
+            {
+                var value = ReadRleByte();
+
+                result[destination] = value;
+                destination += step;
+
+                if (value == previous)
                 {
-                    int count = input[src++];
-                    if ((count & 0x80) != 0)
-                        count = input[src++] + ((count & 0x7F) << 8) + 128;
-                    while (count-- > 0 && dst < result.Length)
+                    var countByte = ReadRleByte();
+                    var count = countByte;
+
+                    if ((countByte & 0x80) != 0)
                     {
-                        result[dst] = v2;
-                        dst += step;
+                        count = ReadRleByte()
+                            + ((countByte & 0x7F) << 8)
+                            + 128;
                     }
-                    if (dst < result.Length)
+
+                    // 保留原始演算法行為：
+                    // 重複次數只填入尚未超出輸出陣列的範圍。
+                    while (count-- > 0 && destination < result.Length)
                     {
-                        v2 = input[src++];
-                        result[dst] = v2;
-                        dst += step;
+                        result[destination] = value;
+                        destination += step;
+                    }
+
+                    if (destination < result.Length)
+                    {
+                        value = ReadRleByte();
+
+                        result[destination] = value;
+                        destination += step;
                     }
                 }
-                v1 = v2;
+
+                previous = value;
             }
         }
+
         return result;
     }
 
     private sealed class MsbBitReader
     {
         private readonly byte[] _data;
-        private int _pos;
+        private int _position;
         private readonly int _end;
         private int _bitsLeft;
         private int _currentByte;
@@ -201,34 +395,45 @@ public sealed class BmrDecoder
         public MsbBitReader(byte[] data, int offset, int length)
         {
             _data = data;
-            _pos = offset;
-            _end = offset + length;
-            _bitsLeft = 0;
-            _currentByte = 0;
+            _position = offset;
+            _end = checked(offset + length);
         }
 
         public int GetNextBit()
         {
             if (_bitsLeft == 0)
             {
-                if (_pos >= _end) return -1;
-                _currentByte = _data[_pos++];
+                if (_position >= _end)
+                {
+                    return -1;
+                }
+
+                _currentByte = _data[_position++];
                 _bitsLeft = 8;
             }
+
             _bitsLeft--;
+
             return (_currentByte >> _bitsLeft) & 1;
         }
 
         public int GetBits(int count)
         {
-            int value = 0;
-            for (int i = 0; i < count; i++)
+            var value = 0;
+
+            for (var i = 0; i < count; i++)
             {
-                int bit = GetNextBit();
+                var bit = GetNextBit();
+
                 if (bit < 0)
-                    throw new EndOfStreamException("Unexpected end of BMR bit stream.");
+                {
+                    throw new EndOfStreamException(
+                        "Unexpected end of BMR bit stream.");
+                }
+
                 value = (value << 1) | bit;
             }
+
             return value;
         }
     }
