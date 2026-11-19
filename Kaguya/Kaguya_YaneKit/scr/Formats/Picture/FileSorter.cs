@@ -1,24 +1,22 @@
 // ============================================================================
 // FileSorter.cs
-// 按文件格式签名将解包后的游戏文件分拣到对应子目录
+// 按檔案格式簽名將解包後的遊戲檔案分拣到對應子目錄
 //
-// 职责:
-//   Sort                   -- 扫描源目录所有文件, 按 IFormatHandler.Identify 分拣
-//   SortArchiveDirectories -- 检测 _link_manifest.json 自动识别档案子目录并逐个分拣
+// 職責:
+//   Sort                   -- 掃描來源目錄所有檔案，按 IFormatHandler.Identify 分拣
+//   SortArchiveDirectories -- 偵測 _link_manifest.json / _archive_manifest.json 並逐個分拣
 //
-// 分拣算法:
-//   对每个文件, 依次用所有注册的 Handler 尝试识别 (读文件头魔数)
-//   匹配成功后复制到 {workDir}/{format}/orig/ 并生成 metadata JSON
-//   跳过 .json/.txt/.xml/.ini/.csv/.log 等非二进制文件
+// 分拣演算法:
+//   對每個檔案，依序用所有註冊的 Handler 嘗試識別
+//   匹配成功後複製到 {workDir}/{format}/orig/ 並產生 metadata JSON
+//   跳過 .json/.txt/.xml/.ini/.csv/.log 等非二進位檔案
 //
-// 并行处理: Parallel.ForEach + PictureProcessing.ParallelOptions
-//
-// 依赖: IFormatHandler (各 Handler 实现), PictureProcessing,
-//        Core.ReadableUnicodeJson
+// 依賴: IFormatHandler、PictureProcessing、Core.ReadableUnicodeJson
 // ============================================================================
 using Kaguya_YaneKit.Formats.Picture.Handlers;
-using System.Text.Json;
+using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using Kaguya_YaneKit.Core;
 
 namespace Kaguya_YaneKit.Formats.Picture;
@@ -75,7 +73,9 @@ public static class FileSorter
             .Select(Path.GetDirectoryName)
             .Where(dir => !string.IsNullOrWhiteSpace(dir))
             .Select(dir => dir!)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Distinct(OperatingSystem.IsWindows()
+                ? StringComparer.OrdinalIgnoreCase
+                : StringComparer.Ordinal)
             .OrderBy(dir => dir, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
@@ -84,16 +84,65 @@ public static class FileSorter
             return false;
         }
 
+        // 以封包目錄相對於 sourceRoot 的完整路徑作為工作目錄鍵，
+        // 避免 GameA\arc 與 GameB\arc 因 basename 相同而共用同一工作目錄。
+        var outputRoots = new HashSet<string>(OperatingSystem.IsWindows()
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal);
+
         foreach (var archiveDir in archiveDirs)
         {
-            var archiveName = new DirectoryInfo(archiveDir).Name;
-            Sort(archiveDir, Path.Combine(workRoot, archiveName), archiveName, archiveName);
+            var relativeArchivePath = Path.GetRelativePath(sourceRoot, archiveDir);
+            var isRootArchive = relativeArchivePath == ".";
+            var sourceArchiveKey = isRootArchive
+                ? new DirectoryInfo(archiveDir).Name
+                : relativeArchivePath;
+            var workFolderName = GetArchiveWorkFolderName(relativeArchivePath, archiveDir);
+            var archiveWorkDir = Path.GetFullPath(Path.Combine(workRoot, workFolderName));
+
+            if (!outputRoots.Add(archiveWorkDir))
+            {
+                throw new InvalidDataException(
+                    $"Multiple archive directories resolve to the same picture work directory: {archiveWorkDir}");
+            }
+
+            // 工作目錄維持單層 archive 資料夾，符合 FileConverter 的既有掃描方式；
+            // 若來源封包位於子資料夾，使用穩定雜湊區分同名封包，避免 basename 碰撞。
+            // metadata 仍保存相對 sourceRoot 的完整路徑，回封時可正確移除封包前綴。
+            Sort(
+                archiveDir,
+                archiveWorkDir,
+                sourceArchiveKey,
+                sourceArchiveKey);
         }
 
         return true;
     }
 
-    public static SortSummary Sort(string sourceDir, string workDir, string? originalPathPrefix, string? sourceArchive, bool quiet = false, Action<int, int>? progress = null)
+    private static string GetArchiveWorkFolderName(string relativeArchivePath, string archiveDir)
+    {
+        if (relativeArchivePath == ".")
+        {
+            return new DirectoryInfo(archiveDir).Name;
+        }
+
+        var normalized = relativeArchivePath.Replace('\\', '/').Trim('/');
+        if (!normalized.Contains('/'))
+        {
+            return normalized;
+        }
+
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized)))[..12];
+        return $"{new DirectoryInfo(archiveDir).Name}__{hash}";
+    }
+
+    public static SortSummary Sort(
+        string sourceDir,
+        string workDir,
+        string? originalPathPrefix,
+        string? sourceArchive,
+        bool quiet = false,
+        Action<int, int>? progress = null)
     {
         sourceDir = Path.GetFullPath(sourceDir);
         workDir = Path.GetFullPath(workDir);
@@ -137,7 +186,11 @@ public static class FileSorter
                         OriginalRelativePath = originalRelativePath,
                         SourceArchive = sourceArchive
                     };
-                    var serializerOptions = new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+                    var serializerOptions = new JsonSerializerOptions
+                    {
+                        WriteIndented = true,
+                        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+                    };
                     var json = JsonSerializer.Serialize(metadata, serializerOptions);
 
                     string destMetaPath;
@@ -193,10 +246,24 @@ public static class FileSorter
         {
             var source = new FileInfo(sourcePath);
             var destination = new FileInfo(destinationPath);
-            if (source.Length == destination.Length &&
-                source.LastWriteTimeUtc == destination.LastWriteTimeUtc)
+            if (source.Length == destination.Length)
             {
-                return;
+                byte[] sourceHash;
+                byte[] destinationHash;
+
+                using (var sourceStream = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                using (var destinationStream = new FileStream(destinationPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    sourceHash = SHA256.HashData(sourceStream);
+                    destinationHash = SHA256.HashData(destinationStream);
+                }
+
+                if (sourceHash.AsSpan().SequenceEqual(destinationHash))
+                {
+                    // 內容相同時同步時間戳，避免工作副本留下過時的檔案時間。
+                    File.SetLastWriteTimeUtc(destinationPath, source.LastWriteTimeUtc);
+                    return;
+                }
             }
         }
 

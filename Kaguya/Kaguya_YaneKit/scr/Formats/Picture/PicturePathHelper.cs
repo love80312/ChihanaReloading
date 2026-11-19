@@ -1,15 +1,11 @@
 // ============================================================================
 // PicturePathHelper.cs
-// 图片路径解析工具: 在元数据和实际文件路径之间转换
+// 圖片路徑解析工具：在中繼資料和實際檔案路徑之間轉換
 //
-// 职责:
-//   GetMetadataPathForSource  -- 从 fix/png/orig 中的源文件路径推导 metadata JSON 路径
-//   GetArchiveRelativePath    -- 从元数据中恢复档案内相对路径 (用于 Repack/Restore)
-//
-// 路径推导算法:
-//   向上搜索祖先目录找到 "fix"、"png" 或 "orig", 然后定位同级的 "metadata" 目录
-//
-// 依赖: System.Text.Json
+// 職責：
+//   GetMetadataPathForSource  -- 從 fix/png/orig 中的來源檔案推導 metadata JSON 路徑
+//   GetArchiveRelativePath    -- 從中繼資料還原封包內相對路徑
+//   GetSafeDestinationPath    -- 驗證相對路徑並限制輸出在指定目錄內
 // ============================================================================
 using System.Text.Json;
 
@@ -52,23 +48,122 @@ internal static class PicturePathHelper
         return Path.Combine(formatDir, "metadata", metadataRelativePath + ".json");
     }
 
-    public static string GetArchiveRelativePath(Dictionary<string, JsonElement> metadata, string originalRelativePath, string formatDir)
+    public static string GetArchiveRelativePath(
+        Dictionary<string, JsonElement> metadata,
+        string originalRelativePath,
+        string formatDir)
     {
+        _ = formatDir; // 保留既有方法簽章，避免影響呼叫端。
+
         if (metadata.TryGetValue("SourceArchive", out var archiveNode) &&
             archiveNode.ValueKind == JsonValueKind.String)
         {
             var sourceArchive = archiveNode.GetString();
             if (!string.IsNullOrWhiteSpace(sourceArchive))
             {
-                var prefix = sourceArchive.TrimEnd('\\', '/') + Path.DirectorySeparatorChar;
-                if (originalRelativePath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                // 先統一分隔符，避免 metadata 使用另一種斜線時無法移除封包前綴。
+                var normalizedPath = originalRelativePath.Replace('\\', '/');
+                var normalizedArchive = sourceArchive.Trim().Trim('\\', '/').Replace('\\', '/');
+                var prefix = normalizedArchive + "/";
+
+                if (normalizedArchive.Length > 0 &&
+                    normalizedPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
                 {
-                    return originalRelativePath.Substring(prefix.Length);
+                    return normalizedPath[prefix.Length..];
                 }
             }
         }
 
         return originalRelativePath;
+    }
+
+    /// <summary>
+    /// 將中繼資料中的相對路徑轉成完整輸出路徑。
+    /// 拒絕絕對路徑、磁碟機路徑、. / .. 路徑段、非法檔名字元及輸出根目錄外路徑。
+    /// </summary>
+    public static string GetSafeDestinationPath(string outputRoot, string relativePath)
+    {
+        if (string.IsNullOrWhiteSpace(relativePath))
+        {
+            throw new InvalidDataException("Metadata contains an empty output relative path.");
+        }
+
+        var normalized = relativePath
+            .Replace('\\', Path.DirectorySeparatorChar)
+            .Replace('/', Path.DirectorySeparatorChar);
+
+        if (Path.IsPathRooted(normalized) ||
+            (normalized.Length >= 2 &&
+             char.IsAsciiLetter(normalized[0]) &&
+             normalized[1] == ':'))
+        {
+            throw new InvalidDataException($"Metadata output path must be relative: {relativePath}");
+        }
+
+        var segments = normalized.Split(
+            Path.DirectorySeparatorChar,
+            StringSplitOptions.RemoveEmptyEntries);
+
+        if (segments.Length == 0)
+        {
+            throw new InvalidDataException($"Metadata output path is empty: {relativePath}");
+        }
+
+        var invalidFileNameChars = Path.GetInvalidFileNameChars();
+        foreach (var segment in segments)
+        {
+            if (segment is "." or ".." ||
+                segment.IndexOfAny(invalidFileNameChars) >= 0 ||
+                segment.EndsWith(' ') ||
+                segment.EndsWith('.'))
+            {
+                throw new InvalidDataException($"Metadata output path contains an invalid path segment: {relativePath}");
+            }
+
+            // Windows 保留裝置名稱，即使後面帶副檔名也不能當成一般檔案使用。
+            var deviceName = segment.Split('.')[0].TrimEnd(' ', '.');
+            if (IsReservedWindowsDeviceName(deviceName))
+            {
+                throw new InvalidDataException($"Metadata output path contains a reserved Windows name: {relativePath}");
+            }
+        }
+
+        var fullRoot = Path.GetFullPath(outputRoot);
+        var fullPath = Path.GetFullPath(Path.Combine(fullRoot, normalized));
+        var rootPrefix = Path.EndsInDirectorySeparator(fullRoot)
+            ? fullRoot
+            : fullRoot + Path.DirectorySeparatorChar;
+        var comparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+
+        if (!fullPath.StartsWith(rootPrefix, comparison))
+        {
+            throw new InvalidDataException($"Metadata output path escapes the output directory: {relativePath}");
+        }
+
+        return fullPath;
+    }
+
+    private static bool IsReservedWindowsDeviceName(string name)
+    {
+        if (name.Equals("CON", StringComparison.OrdinalIgnoreCase) ||
+            name.Equals("PRN", StringComparison.OrdinalIgnoreCase) ||
+            name.Equals("AUX", StringComparison.OrdinalIgnoreCase) ||
+            name.Equals("NUL", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (name.Length == 4 &&
+            (name.StartsWith("COM", StringComparison.OrdinalIgnoreCase) ||
+             name.StartsWith("LPT", StringComparison.OrdinalIgnoreCase)) &&
+            name[3] is >= '1' and <= '9')
+        {
+            return true;
+        }
+
+        return false;
     }
 
     private static string? FindAncestorDirectory(string path, string directoryName)

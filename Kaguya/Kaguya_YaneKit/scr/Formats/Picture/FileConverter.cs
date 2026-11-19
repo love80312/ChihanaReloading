@@ -1,26 +1,17 @@
 // ============================================================================
 // FileConverter.cs
-// 图片格式批量转换与重打包引擎
+// 圖片格式批次轉換與重新封裝引擎
 //
-// 职责:
-//   ConvertAll  -- 遍历工作目录, 将 orig/ 中的原始文件转换为 PNG 到 png/
-//   RepackAll   -- 遍历工作目录, 将 fix/ 中修改后的 PNG 重打包为原始格式到 new/
-//   RepackPngAll -- 遍历工作目录, 将 png/ 中的 PNG 直接重打包为原始格式到 new/
-//   RepackFix   -- 对指定的单个 fix/ 目录执行重打包
+// 職責:
+//   ConvertAll   -- 遍歷工作目錄，將 orig/ 中的原始檔案轉換為 PNG 到 png/
+//   RepackAll    -- 將 fix/ 中修改後的 PNG 重新封裝為原始格式到 new/
+//   RepackPngAll -- 將 png/ 中的 PNG 直接重新封裝為原始格式到 new/
+//   RepackFix    -- 對指定的單一 fix/ 目錄執行重新封裝
 //
-// 目录结构 (每个格式子目录):
-//   {format}/orig/      原始游戏文件
-//   {format}/png/       转换后的 PNG
-//   {format}/metadata/  每个文件的 JSON 元数据 (偏移/尺寸/原始路径等)
-//   {format}/fix/       用户修改后的 PNG (手动放置)
-//   {format}/new/       重打包后的原始格式文件
-//
-// 转换算法: 通过 IFormatHandler 接口分派, 支持 AP0/AP2/AP3/ANM/BMP/AP 六种格式
-// 并行处理: 使用 Parallel.ForEach + PictureProcessing.ParallelOptions
-// 进度汇报: 使用 PictureProcessing.StartProgress, 格式 [CONVERT arc/FMT] N/M (X%)
-//
-// 依赖: IFormatHandler (各 Handler 实现), PictureProcessing, PicturePathHelper,
-//        Core.ReadableUnicodeJson
+// 重新封裝安全原則:
+//   1. 先完整讀取 metadata 並建立所有目的路徑計畫。
+//   2. 拒絕絕對路徑、路徑穿越、重複目的地及檔案/資料夾衝突。
+//   3. 全部預檢通過後才開始寫入；每個輸出先寫暫存檔，再替換正式檔案。
 // ============================================================================
 using Kaguya_YaneKit.Formats.Picture.Handlers;
 using Kaguya_YaneKit.Core;
@@ -42,6 +33,12 @@ public static class FileConverter
             Success + other.Success,
             Failure + other.Failure);
     }
+
+    private sealed record RepackPlan(string SourcePath, string DestinationPath);
+
+    private static StringComparer PathComparer => OperatingSystem.IsWindows()
+        ? StringComparer.OrdinalIgnoreCase
+        : StringComparer.Ordinal;
 
     private static readonly Dictionary<string, IFormatHandler> Handlers = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -99,7 +96,11 @@ public static class FileConverter
         return RepackFromSourceAll(path, "png", quiet, progress);
     }
 
-    private static ConversionSummary RepackFromSourceAll(string path, string sourceDirectoryName, bool quiet = false, Action<int, int>? externalProgress = null)
+    private static ConversionSummary RepackFromSourceAll(
+        string path,
+        string sourceDirectoryName,
+        bool quiet = false,
+        Action<int, int>? externalProgress = null)
     {
         var stopwatch = Stopwatch.StartNew();
         path = Path.GetFullPath(path);
@@ -176,7 +177,11 @@ public static class FileConverter
         return summary;
     }
 
-    private static ConversionSummary ProcessRepackWorkDir(string path, string sourceDirectoryName, bool quiet = false, Action? fileProgress = null)
+    private static ConversionSummary ProcessRepackWorkDir(
+        string path,
+        string sourceDirectoryName,
+        bool quiet = false,
+        Action? fileProgress = null)
     {
         var summary = new ConversionSummary();
         foreach (var handler in Handlers.Values)
@@ -225,7 +230,11 @@ public static class FileConverter
         return new ConversionSummary();
     }
 
-    private static ConversionSummary ProcessConvertFormat(string formatDir, IFormatHandler handler, bool quiet = false, Action? fileProgress = null)
+    private static ConversionSummary ProcessConvertFormat(
+        string formatDir,
+        IFormatHandler handler,
+        bool quiet = false,
+        Action? fileProgress = null)
     {
         var origDir = Path.Combine(formatDir, "orig");
         var pngDir = Path.Combine(formatDir, "png");
@@ -286,7 +295,11 @@ public static class FileConverter
                     baseNode[property.Key] = node;
                 }
 
-                var serializerOptions = new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+                var serializerOptions = new JsonSerializerOptions
+                {
+                    WriteIndented = true,
+                    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+                };
                 ReadableUnicodeJson.WriteAllText(metaPath, baseNode.ToJsonString(serializerOptions));
                 Interlocked.Increment(ref success);
             }
@@ -436,100 +449,174 @@ public static class FileConverter
         Console.WriteLine($"  [{label}] {summary.Batches} batches, {summary.Total} total, {summary.Success} success, {summary.Failure} failure, elapsed={elapsed.TotalSeconds:F2}s.");
     }
 
-    private static ConversionSummary ProcessRepackFormat(string formatDir, IFormatHandler handler, string sourceDir, bool quiet = false, Action? fileProgress = null)
+    private static ConversionSummary ProcessRepackFormat(
+        string formatDir,
+        IFormatHandler handler,
+        string sourceDir,
+        bool quiet = false,
+        Action? fileProgress = null)
     {
         var metaDir = Path.Combine(formatDir, "metadata");
         var newDir = Path.Combine(formatDir, "new");
-        if (!Directory.Exists(sourceDir) || !Directory.Exists(metaDir)) return new ConversionSummary();
-        Directory.CreateDirectory(newDir);
-
-        int success = 0, failure = 0;
-
-        if (handler is AnmHandler or PltHandler)
+        if (!Directory.Exists(sourceDir) || !Directory.Exists(metaDir))
         {
-            var dirs = Directory.GetDirectories(sourceDir, "*", SearchOption.AllDirectories)
-                .Where(d => !Directory.EnumerateDirectories(d).Any())
-                .ToArray();
-            Parallel.ForEach(dirs, PictureProcessing.ParallelOptions, dir =>
-            {
-                try
-                {
-                    var relPath = Path.GetRelativePath(sourceDir, dir);
-                    var metadataPath = Path.Combine(metaDir, relPath + ".json");
-                    if (!File.Exists(metadataPath))
-                    {
-                        if (!quiet)
-                        {
-                            PictureProcessing.WriteLine($"Warning: metadata not found for \"{relPath}\", skipped.");
-                        }
-                        Interlocked.Increment(ref failure);
-                        return;
-                    }
-
-                    var json = File.ReadAllText(metadataPath);
-                    var metadata = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(json)!;
-                    var originalRelativePath = metadata["OriginalRelativePath"].GetString()!;
-                    var finalFileName = PicturePathHelper.GetArchiveRelativePath(metadata, originalRelativePath, formatDir);
-                    if (string.IsNullOrEmpty(finalFileName) || finalFileName == ".")
-                    {
-                        finalFileName = new DirectoryInfo(dir).Name;
-                    }
-
-                    var destPath = Path.Combine(newDir, finalFileName);
-                    Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
-                    handler.Repack(dir, destPath);
-                    Interlocked.Increment(ref success);
-                }
-                catch (Exception ex)
-                {
-                    if (!quiet)
-                    {
-                        PictureProcessing.WriteLine($"Failed to repack {handler.Tag.ToUpperInvariant()} \"{Path.GetFileName(dir)}\": {ex.Message}");
-                    }
-                    Interlocked.Increment(ref failure);
-                }
-                finally
-                {
-                    fileProgress?.Invoke();
-                }
-            });
-
-            return new ConversionSummary(1, dirs.Length, success, failure);
+            return new ConversionSummary();
         }
 
-        var files = Directory.GetFiles(sourceDir, "*.png", SearchOption.AllDirectories);
-        Parallel.ForEach(files, PictureProcessing.ParallelOptions, file =>
+        var isAnimation = handler is AnmHandler or PltHandler;
+        var sourceItems = isAnimation
+            ? Directory.GetDirectories(sourceDir, "*", SearchOption.AllDirectories)
+                .Where(dir => !Directory.EnumerateDirectories(dir).Any())
+                .ToArray()
+            : Directory.GetFiles(sourceDir, "*.png", SearchOption.AllDirectories);
+
+        if (sourceItems.Length == 0)
+        {
+            return new ConversionSummary();
+        }
+
+        // 第一階段：只讀取輸入和 metadata，建立完整的輸出計畫，不建立或覆寫任何輸出檔案。
+        var plans = new List<RepackPlan>(sourceItems.Length);
+        var prepareErrors = new List<string>();
+
+        foreach (var item in sourceItems)
         {
             try
             {
-                var relPath = Path.GetRelativePath(sourceDir, file);
-                var baseName = PicturePathHelper.RemoveExtensionPreservingName(relPath, ".png");
-                var metadataPath = Path.Combine(metaDir, baseName + ".json");
-                if (!File.Exists(metadataPath))
+                var relativePath = Path.GetRelativePath(sourceDir, item);
+                string metadataPath;
+                string handlerSourcePath;
+
+                if (isAnimation)
                 {
-                    if (!quiet)
-                    {
-                        PictureProcessing.WriteLine($"Warning: metadata not found for \"{relPath}\", skipped.");
-                    }
-                    Interlocked.Increment(ref failure);
-                    return;
+                    metadataPath = Path.Combine(metaDir, relativePath + ".json");
+                    handlerSourcePath = item;
+                }
+                else
+                {
+                    var baseName = PicturePathHelper.RemoveExtensionPreservingName(relativePath, ".png");
+                    metadataPath = Path.Combine(metaDir, baseName + ".json");
+                    handlerSourcePath = Path.Combine(sourceDir, baseName);
                 }
 
-                var json = File.ReadAllText(metadataPath);
-                var metadata = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(json)!;
-                var originalRelativePath = metadata["OriginalRelativePath"].GetString()!;
-                var finalFileName = PicturePathHelper.GetArchiveRelativePath(metadata, originalRelativePath, formatDir);
-                var destFile = Path.Combine(newDir, finalFileName);
-                var sourcePathBase = Path.Combine(sourceDir, baseName);
-                Directory.CreateDirectory(Path.GetDirectoryName(destFile)!);
-                handler.Repack(sourcePathBase, destFile);
+                if (!File.Exists(metadataPath))
+                {
+                    throw new FileNotFoundException($"Metadata not found for \"{relativePath}\".", metadataPath);
+                }
+
+                var metadata = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(
+                    File.ReadAllText(metadataPath),
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                    ?? throw new InvalidDataException($"Metadata JSON is empty or invalid: {metadataPath}");
+
+                if (!metadata.TryGetValue("OriginalRelativePath", out var originalPathNode) ||
+                    originalPathNode.ValueKind != JsonValueKind.String)
+                {
+                    throw new InvalidDataException($"Metadata does not contain a string OriginalRelativePath: {metadataPath}");
+                }
+
+                var originalRelativePath = originalPathNode.GetString();
+                if (string.IsNullOrWhiteSpace(originalRelativePath))
+                {
+                    throw new InvalidDataException($"Metadata contains an empty OriginalRelativePath: {metadataPath}");
+                }
+
+                var archiveRelativePath = PicturePathHelper.GetArchiveRelativePath(
+                    metadata,
+                    originalRelativePath,
+                    formatDir);
+                var destinationPath = PicturePathHelper.GetSafeDestinationPath(newDir, archiveRelativePath);
+                plans.Add(new RepackPlan(handlerSourcePath, destinationPath));
+            }
+            catch (Exception ex)
+            {
+                prepareErrors.Add($"{Path.GetFileName(item)}: {ex.Message}");
+            }
+        }
+
+        if (prepareErrors.Count > 0)
+        {
+            if (!quiet)
+            {
+                foreach (var error in prepareErrors)
+                {
+                    PictureProcessing.WriteLine($"Failed to prepare repack: {error}");
+                }
+                PictureProcessing.WriteLine("Repack cancelled: preflight failed; no output files were written.");
+            }
+
+            for (var i = 0; i < sourceItems.Length; i++)
+            {
+                fileProgress?.Invoke();
+            }
+
+            // 預檢有任何一筆失敗，就不只跳過該筆，而是停止整個格式批次，避免產生不完整 new/。
+            return new ConversionSummary(1, sourceItems.Length, 0, sourceItems.Length);
+        }
+
+        // 第二階段：檢查重複目的地、檔案/資料夾衝突與既有 reparse point。
+        try
+        {
+            ValidateRepackPlan(newDir, plans);
+        }
+        catch (Exception ex)
+        {
+            if (!quiet)
+            {
+                PictureProcessing.WriteLine($"Repack cancelled: {ex.Message}");
+                PictureProcessing.WriteLine("No output files were written.");
+            }
+
+            for (var i = 0; i < sourceItems.Length; i++)
+            {
+                fileProgress?.Invoke();
+            }
+
+            return new ConversionSummary(1, sourceItems.Length, 0, sourceItems.Length);
+        }
+
+        // 第三階段：所有計畫通過預檢後才開始建立輸出目錄及寫檔。
+        Directory.CreateDirectory(newDir);
+        int success = 0, failure = 0;
+
+        Parallel.ForEach(plans, PictureProcessing.ParallelOptions, plan =>
+        {
+            var destinationDirectory = Path.GetDirectoryName(plan.DestinationPath)!;
+            var temporaryPath = Path.Combine(
+                destinationDirectory,
+                $".{Path.GetFileName(plan.DestinationPath)}.{Guid.NewGuid():N}.tmp");
+
+            try
+            {
+                Directory.CreateDirectory(destinationDirectory);
+                handler.Repack(plan.SourcePath, temporaryPath);
+
+                if (!File.Exists(temporaryPath))
+                {
+                    throw new IOException("The format handler did not create its temporary output file.");
+                }
+
+                // 使用同目錄暫存檔替換，單一檔案回封失敗時不會截斷上一版輸出。
+                File.Move(temporaryPath, plan.DestinationPath, true);
                 Interlocked.Increment(ref success);
             }
             catch (Exception ex)
             {
+                try
+                {
+                    if (File.Exists(temporaryPath))
+                    {
+                        File.Delete(temporaryPath);
+                    }
+                }
+                catch
+                {
+                    // 保留主要回封錯誤；暫存檔清理失敗不覆蓋原始例外。
+                }
+
                 if (!quiet)
                 {
-                    PictureProcessing.WriteLine($"Failed to repack \"{Path.GetFileName(file)}\": {ex.Message}");
+                    PictureProcessing.WriteLine($"Failed to repack \"{Path.GetFileName(plan.SourcePath)}\": {ex.Message}");
                 }
                 Interlocked.Increment(ref failure);
             }
@@ -539,7 +626,89 @@ public static class FileConverter
             }
         });
 
-        return new ConversionSummary(1, files.Length, success, failure);
+        if (!quiet)
+        {
+            Console.WriteLine($"  [REPACK {handler.Tag.ToUpperInvariant()}] done: {sourceItems.Length} total, {success} success, {failure} failure.");
+        }
+
+        return new ConversionSummary(1, sourceItems.Length, success, failure);
     }
 
+    private static void ValidateRepackPlan(string outputRoot, IReadOnlyList<RepackPlan> plans)
+    {
+        var fullRoot = Path.GetFullPath(outputRoot);
+        if (File.Exists(fullRoot))
+        {
+            throw new IOException($"Repack output root is an existing file: {fullRoot}");
+        }
+
+        if (Directory.Exists(fullRoot) && IsReparsePoint(fullRoot))
+        {
+            throw new InvalidDataException($"Repack output root is a reparse point: {fullRoot}");
+        }
+
+        var destinations = new HashSet<string>(PathComparer);
+        foreach (var plan in plans)
+        {
+            if (!destinations.Add(plan.DestinationPath))
+            {
+                throw new InvalidDataException($"Multiple image sources target the same output file: {plan.DestinationPath}");
+            }
+        }
+
+        // 同一批次不能同時把某路徑當成檔案，又把它當成其他輸出的上層資料夾。
+        foreach (var destination in destinations)
+        {
+            var parent = Path.GetDirectoryName(destination);
+            while (!string.IsNullOrEmpty(parent))
+            {
+                if (destinations.Contains(parent))
+                {
+                    throw new InvalidDataException($"Repack output has a file/directory path conflict: {parent}");
+                }
+
+                if (PathComparer.Equals(parent, fullRoot))
+                {
+                    break;
+                }
+
+                parent = Path.GetDirectoryName(parent);
+            }
+        }
+
+        // 檢查已存在的路徑元件，避免透過 junction/symlink 將輸出導向 new/ 之外。
+        foreach (var destination in destinations)
+        {
+            if (Directory.Exists(destination))
+            {
+                throw new IOException($"Repack destination is already a directory: {destination}");
+            }
+
+            var parent = Path.GetDirectoryName(destination);
+            while (!string.IsNullOrEmpty(parent))
+            {
+                if (File.Exists(parent))
+                {
+                    throw new IOException($"Repack output parent is an existing file: {parent}");
+                }
+
+                if (Directory.Exists(parent) && IsReparsePoint(parent))
+                {
+                    throw new InvalidDataException($"Repack output path contains a reparse point: {parent}");
+                }
+
+                if (PathComparer.Equals(parent, fullRoot))
+                {
+                    break;
+                }
+
+                parent = Path.GetDirectoryName(parent);
+            }
+        }
+    }
+
+    private static bool IsReparsePoint(string path)
+    {
+        return (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0;
+    }
 }
