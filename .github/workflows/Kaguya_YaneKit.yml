@@ -7,7 +7,7 @@ on:
       - main
     paths:
       - "Kaguya/Kaguya_YaneKit/**"
-      - ".github/workflows/exe.yml"
+      - ".github/workflows/Kaguya_YaneKit.yml"
 
   workflow_dispatch:
 
