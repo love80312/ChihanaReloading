@@ -78,12 +78,19 @@ public sealed class KaguyaRuntimeContext
         return Environment.CurrentDirectory;
     }
 
-    // 優先級: 命令列指定 > game root > CWD > 工具目錄
+    // 優先級:
+    //   1. 命令列明確指定 --params
+    //   2. 明確指定 --game-root 時，只搜尋該遊戲根目錄
+    //   3. 未指定 game root 時，才依序搜尋 CWD 與工具目錄
+    //
+    // 不可在明確指定 game root 卻找不到 params.dat 時，
+    // 回頭讀取其他遊戲的檔案。
     private static string? ResolveParamsPath(string? gameRoot, string? paramsPath)
     {
         if (!string.IsNullOrWhiteSpace(paramsPath))
         {
             var fullParamsPath = Path.GetFullPath(paramsPath);
+
             if (!File.Exists(fullParamsPath))
             {
                 throw new FileNotFoundException(
@@ -94,15 +101,21 @@ public sealed class KaguyaRuntimeContext
             return fullParamsPath;
         }
 
-        var candidates = new List<string>();
-
         if (!string.IsNullOrWhiteSpace(gameRoot))
         {
-            candidates.Add(Path.Combine(Path.GetFullPath(gameRoot), "params.dat"));
+            var explicitGameRoot = Path.GetFullPath(gameRoot);
+            var gameRootCandidate = Path.Combine(explicitGameRoot, "params.dat");
+
+            return File.Exists(gameRootCandidate)
+                ? gameRootCandidate
+                : null;
         }
 
-        candidates.Add(Path.Combine(Environment.CurrentDirectory, "params.dat"));
-        candidates.Add(Path.Combine(AppContext.BaseDirectory, "params.dat"));
+        var candidates = new[]
+        {
+            Path.Combine(Environment.CurrentDirectory, "params.dat"),
+            Path.Combine(AppContext.BaseDirectory, "params.dat")
+        };
 
         return candidates.FirstOrDefault(File.Exists);
     }
@@ -110,6 +123,7 @@ public sealed class KaguyaRuntimeContext
     private static string? ResolveTblstrArchivePath(string gameRoot)
     {
         var root = Path.GetFullPath(gameRoot);
+
         var candidates = new[]
         {
             Path.Combine(root, "tblstr.arc"),
