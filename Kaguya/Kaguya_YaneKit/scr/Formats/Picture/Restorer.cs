@@ -3,6 +3,7 @@
 // 將處理後的檔案還原到輸出目錄
 // ============================================================================
 using System.Text.Json;
+using Kaguya_YaneKit.Core;
 
 namespace Kaguya_YaneKit.Formats.Picture;
 
@@ -93,6 +94,7 @@ public static class Restorer
         workDir = Path.GetFullPath(workDir);
         outputDir = Path.GetFullPath(outputDir);
 
+        SafePath.ValidateOutputRoot(outputDir);
         Directory.CreateDirectory(outputDir);
 
         var files = EnumerateNamedDirFiles(
@@ -121,6 +123,7 @@ public static class Restorer
         workDir = Path.GetFullPath(workDir);
         outputDir = Path.GetFullPath(outputDir);
 
+        SafePath.ValidateOutputRoot(outputDir);
         Directory.CreateDirectory(outputDir);
 
         var newFiles = EnumerateNamedDirFiles(
@@ -276,13 +279,11 @@ public static class Restorer
                         outputDir,
                         plan.DestinationPath);
 
-                    Directory.CreateDirectory(
-                        Path.GetDirectoryName(plan.DestinationPath)!);
-
-                    File.Copy(
+                    CopyFileAtomically(
                         plan.Source.FilePath,
                         plan.DestinationPath,
-                        false);
+                        outputDir,
+                        overwrite: false);
 
                     restoreProgress.MarkReplenished();
                 }
@@ -373,6 +374,10 @@ public static class Restorer
                     outputDir,
                     metadata.OriginalRelativePath);
 
+                ValidateDestinationAgainstExistingFiles(
+                    outputDir,
+                    destination);
+
                 candidates.Add(
                     new RestorePlan(source, destination));
             }
@@ -441,13 +446,11 @@ public static class Restorer
             {
                 try
                 {
-                    Directory.CreateDirectory(
-                        Path.GetDirectoryName(plan.DestinationPath)!);
-
-                    File.Copy(
+                    CopyFileAtomically(
                         plan.Source.FilePath,
                         plan.DestinationPath,
-                        true);
+                        outputDir,
+                        overwrite: true);
 
                     restoreProgress.MarkRestored();
                 }
@@ -489,81 +492,84 @@ public static class Restorer
         string outputDir,
         string destinationPath)
     {
-        var root = Path.GetFullPath(outputDir);
-        var parent = Path.GetDirectoryName(destinationPath);
-
-        while (!string.IsNullOrEmpty(parent))
-        {
-            if (File.Exists(parent))
-            {
-                throw new InvalidDataException(
-                    $"Restore output parent is an existing file: {parent}");
-            }
-
-            if (PathComparer.Equals(parent, root))
-            {
-                break;
-            }
-
-            parent = Path.GetDirectoryName(parent);
-        }
+        SafePath.ValidateExistingPath(outputDir, destinationPath);
     }
 
     private static string GetSafeDestinationPath(
         string outputDir,
         string originalRelativePath)
     {
-        if (string.IsNullOrWhiteSpace(originalRelativePath))
+        return SafePath.GetSafeDestinationPath(outputDir, originalRelativePath);
+    }
+
+    /// <summary>
+    /// 先寫入目的目錄中的暫存檔，完成並 Flush 後才替換正式檔案。
+    /// 因此讀取或複製中斷時，不會先截斷舊的目的檔。
+    /// </summary>
+    private static void CopyFileAtomically(
+        string sourcePath,
+        string destinationPath,
+        string outputRoot,
+        bool overwrite)
+    {
+        SafePath.ValidateExistingPath(outputRoot, destinationPath);
+
+        var destinationDirectory = Path.GetDirectoryName(destinationPath)
+            ?? throw new InvalidDataException($"Invalid restore destination: {destinationPath}");
+        Directory.CreateDirectory(destinationDirectory);
+
+        // 建立目錄後再次檢查，避免預先存在的目錄連結導向其他位置。
+        SafePath.ValidateExistingPath(outputRoot, destinationPath);
+
+        var temporaryPath = Path.Combine(
+            destinationDirectory,
+            $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.tmp");
+
+        try
         {
-            throw new InvalidDataException(
-                "Metadata contains an empty OriginalRelativePath.");
+            using (var source = new FileStream(
+                sourcePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                1024 * 1024,
+                FileOptions.SequentialScan))
+            using (var temporary = new FileStream(
+                temporaryPath,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None,
+                1024 * 1024,
+                FileOptions.SequentialScan))
+            {
+                source.CopyTo(temporary);
+                temporary.Flush(flushToDisk: true);
+            }
+
+            SafePath.ValidateExistingPath(outputRoot, destinationPath);
+
+            if (Directory.Exists(destinationPath))
+            {
+                throw new IOException($"Restore destination is already a directory: {destinationPath}");
+            }
+
+            if (overwrite && File.Exists(destinationPath))
+            {
+                File.Replace(temporaryPath, destinationPath, destinationBackupFileName: null);
+            }
+            else
+            {
+                // 不覆蓋預檢後意外出現的檔案。
+                File.Move(temporaryPath, destinationPath);
+            }
         }
-
-        // 同時正規化兩種分隔符，避免 Windows 風格路徑
-        // 在其他平台被當成普通字元。
-        var normalized = originalRelativePath
-            .Replace('\\', Path.DirectorySeparatorChar)
-            .Replace('/', Path.DirectorySeparatorChar);
-
-        if (Path.IsPathRooted(normalized) ||
-            (normalized.Length >= 2 &&
-             char.IsAsciiLetter(normalized[0]) &&
-             normalized[1] == ':'))
+        finally
         {
-            throw new InvalidDataException(
-                $"Metadata path must be relative: {originalRelativePath}");
+            if (File.Exists(temporaryPath))
+            {
+                File.Delete(temporaryPath);
+            }
         }
-
-        var segments = normalized.Split(
-            Path.DirectorySeparatorChar,
-            StringSplitOptions.RemoveEmptyEntries);
-
-        if (segments.Length == 0 ||
-            segments.Any(segment => segment is "." or ".."))
-        {
-            throw new InvalidDataException(
-                $"Metadata path contains an invalid path segment: {originalRelativePath}");
-        }
-
-        var fullRoot = Path.GetFullPath(outputDir);
-        var fullPath = Path.GetFullPath(
-            Path.Combine(fullRoot, normalized));
-
-        var rootPrefix = Path.EndsInDirectorySeparator(fullRoot)
-            ? fullRoot
-            : fullRoot + Path.DirectorySeparatorChar;
-
-        if (!fullPath.StartsWith(
-                rootPrefix,
-                OperatingSystem.IsWindows()
-                    ? StringComparison.OrdinalIgnoreCase
-                    : StringComparison.Ordinal))
-        {
-            throw new InvalidDataException(
-                $"Metadata path escapes the output directory: {originalRelativePath}");
-        }
-
-        return fullPath;
     }
 
     private static BaseMetadata? ReadMetadata(string jsonFile)

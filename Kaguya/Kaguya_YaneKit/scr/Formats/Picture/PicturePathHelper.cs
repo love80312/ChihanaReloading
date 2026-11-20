@@ -8,6 +8,7 @@
 //   GetSafeDestinationPath    -- 驗證相對路徑並限制輸出在指定目錄內
 // ============================================================================
 using System.Text.Json;
+using Kaguya_YaneKit.Core;
 
 namespace Kaguya_YaneKit.Formats.Picture;
 
@@ -79,91 +80,11 @@ internal static class PicturePathHelper
 
     /// <summary>
     /// 將中繼資料中的相對路徑轉成完整輸出路徑。
-    /// 拒絕絕對路徑、磁碟機路徑、. / .. 路徑段、非法檔名字元及輸出根目錄外路徑。
+    /// 統一交由 SafePath 檢查路徑穿越、Windows 保留檔名及既有 Reparse Point。
     /// </summary>
     public static string GetSafeDestinationPath(string outputRoot, string relativePath)
     {
-        if (string.IsNullOrWhiteSpace(relativePath))
-        {
-            throw new InvalidDataException("Metadata contains an empty output relative path.");
-        }
-
-        var normalized = relativePath
-            .Replace('\\', Path.DirectorySeparatorChar)
-            .Replace('/', Path.DirectorySeparatorChar);
-
-        if (Path.IsPathRooted(normalized) ||
-            (normalized.Length >= 2 &&
-             char.IsAsciiLetter(normalized[0]) &&
-             normalized[1] == ':'))
-        {
-            throw new InvalidDataException($"Metadata output path must be relative: {relativePath}");
-        }
-
-        var segments = normalized.Split(
-            Path.DirectorySeparatorChar,
-            StringSplitOptions.RemoveEmptyEntries);
-
-        if (segments.Length == 0)
-        {
-            throw new InvalidDataException($"Metadata output path is empty: {relativePath}");
-        }
-
-        var invalidFileNameChars = Path.GetInvalidFileNameChars();
-        foreach (var segment in segments)
-        {
-            if (segment is "." or ".." ||
-                segment.IndexOfAny(invalidFileNameChars) >= 0 ||
-                segment.EndsWith(' ') ||
-                segment.EndsWith('.'))
-            {
-                throw new InvalidDataException($"Metadata output path contains an invalid path segment: {relativePath}");
-            }
-
-            // Windows 保留裝置名稱，即使後面帶副檔名也不能當成一般檔案使用。
-            var deviceName = segment.Split('.')[0].TrimEnd(' ', '.');
-            if (IsReservedWindowsDeviceName(deviceName))
-            {
-                throw new InvalidDataException($"Metadata output path contains a reserved Windows name: {relativePath}");
-            }
-        }
-
-        var fullRoot = Path.GetFullPath(outputRoot);
-        var fullPath = Path.GetFullPath(Path.Combine(fullRoot, normalized));
-        var rootPrefix = Path.EndsInDirectorySeparator(fullRoot)
-            ? fullRoot
-            : fullRoot + Path.DirectorySeparatorChar;
-        var comparison = OperatingSystem.IsWindows()
-            ? StringComparison.OrdinalIgnoreCase
-            : StringComparison.Ordinal;
-
-        if (!fullPath.StartsWith(rootPrefix, comparison))
-        {
-            throw new InvalidDataException($"Metadata output path escapes the output directory: {relativePath}");
-        }
-
-        return fullPath;
-    }
-
-    private static bool IsReservedWindowsDeviceName(string name)
-    {
-        if (name.Equals("CON", StringComparison.OrdinalIgnoreCase) ||
-            name.Equals("PRN", StringComparison.OrdinalIgnoreCase) ||
-            name.Equals("AUX", StringComparison.OrdinalIgnoreCase) ||
-            name.Equals("NUL", StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
-        if (name.Length == 4 &&
-            (name.StartsWith("COM", StringComparison.OrdinalIgnoreCase) ||
-             name.StartsWith("LPT", StringComparison.OrdinalIgnoreCase)) &&
-            name[3] is >= '1' and <= '9')
-        {
-            return true;
-        }
-
-        return false;
+        return SafePath.GetSafeDestinationPath(outputRoot, relativePath);
     }
 
     private static string? FindAncestorDirectory(string path, string directoryName)
