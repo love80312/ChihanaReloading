@@ -521,6 +521,11 @@ public static class Restorer
         // 建立目錄後再次檢查，避免預先存在的目錄連結導向其他位置。
         SafePath.ValidateExistingPath(outputRoot, destinationPath);
 
+        // 先記錄來源時間；讀取來源檔可能更新 LastAccessTime。
+        var sourceCreationTimeUtc = File.GetCreationTimeUtc(sourcePath);
+        var sourceLastAccessTimeUtc = File.GetLastAccessTimeUtc(sourcePath);
+        var sourceLastWriteTimeUtc = File.GetLastWriteTimeUtc(sourcePath);
+
         var temporaryPath = Path.Combine(
             destinationDirectory,
             $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.tmp");
@@ -546,6 +551,11 @@ public static class Restorer
                 temporary.Flush(flushToDisk: true);
             }
 
+            // 把來源的三種檔案時間套用到同目錄暫存檔；後續同磁碟區移動/替換時一併保留。
+            File.SetCreationTimeUtc(temporaryPath, sourceCreationTimeUtc);
+            File.SetLastAccessTimeUtc(temporaryPath, sourceLastAccessTimeUtc);
+            File.SetLastWriteTimeUtc(temporaryPath, sourceLastWriteTimeUtc);
+
             SafePath.ValidateExistingPath(outputRoot, destinationPath);
 
             if (Directory.Exists(destinationPath))
@@ -561,6 +571,23 @@ public static class Restorer
             {
                 // 不覆蓋預檢後意外出現的檔案。
                 File.Move(temporaryPath, destinationPath);
+            }
+
+            // Windows ReplaceFile 會保留舊目的檔的 CreationTime；在原子替換完成後，
+            // 再把來源時間套回正式檔案，避免覆蓋還原後沿用舊檔的建立時間。
+            File.SetCreationTimeUtc(destinationPath, sourceCreationTimeUtc);
+            File.SetLastWriteTimeUtc(destinationPath, sourceLastWriteTimeUtc);
+            try
+            {
+                File.SetLastAccessTimeUtc(destinationPath, sourceLastAccessTimeUtc);
+            }
+            catch (IOException)
+            {
+                // 部分檔案系統不支援或延遲更新 LastAccessTime；內容及主要時間仍已完成。
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // LastAccessTime 為附加資訊，權限不足時不回報還原資料失敗。
             }
         }
         finally

@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Text;
+using Kaguya_YaneKit.Core;
 using Microsoft.Win32.SafeHandles;
 
 namespace Kaguya_YaneKit.Formats.Archive;
@@ -141,6 +142,7 @@ public sealed class Af01ArchiveCodec
             overwriteExisting);
 
         Directory.CreateDirectory(outputDirectory);
+        SafePath.ValidateOutputRoot(outputDirectory);
         using var archiveHandle = File.OpenHandle(
             archivePath,
             FileMode.Open,
@@ -153,24 +155,38 @@ public sealed class Af01ArchiveCodec
         Parallel.ForEach(manifest.Entries, new ParallelOptions { MaxDegreeOfParallelism = DefaultExtractParallelism }, entry =>
         {
             var outputPath = GetSafeOutputPath(outputDirectory, entry.Name);
-            Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
-            using var output = CreateExtractionFile(outputPath, overwriteExisting);
+            var parentDirectory = Path.GetDirectoryName(outputPath)
+                ?? throw new InvalidDataException($"Invalid AF01 output path: {entry.Name}");
+            Directory.CreateDirectory(parentDirectory);
+            SafePath.ValidateExistingPath(outputDirectory, outputPath);
 
-            if (entry.IsPacked)
-            {
-                var packed = ReadExact(archiveHandle, entry.DataOffset, checked((int)entry.PackedSize));
-                var unpacked = LzUnpack(packed, checked((int)entry.UnpackedSize));
-                output.Write(unpacked);
-            }
-            else
-            {
-                CopyBytes(archiveHandle, output, entry.DataOffset, entry.UnpackedSize);
-            }
+            WriteExtractionFileAtomically(
+                outputDirectory,
+                outputPath,
+                overwriteExisting,
+                output =>
+                {
+                    if (entry.IsPacked)
+                    {
+                        var packed = ReadExact(archiveHandle, entry.DataOffset, checked((int)entry.PackedSize));
+                        var unpacked = LzUnpack(packed, checked((int)entry.UnpackedSize));
+                        output.Write(unpacked);
+                    }
+                    else
+                    {
+                        CopyBytes(archiveHandle, output, entry.DataOffset, entry.UnpackedSize);
+                    }
+                });
 
             progress?.Invoke(Interlocked.Increment(ref completed), total);
         });
 
-        Af01ArchiveManifestWriter.Write(Path.Combine(outputDirectory, ManifestFileName), manifest);
+        var manifestPath = Path.Combine(outputDirectory, ManifestFileName);
+        WriteExtractionPathAtomically(
+            outputDirectory,
+            manifestPath,
+            overwriteExisting,
+            temporaryPath => Af01ArchiveManifestWriter.Write(temporaryPath, manifest));
     }
 
     public void PackFromManifest(
@@ -614,43 +630,92 @@ public sealed class Af01ArchiveCodec
 
     private static string GetSafeOutputPath(string rootDirectory, string entryName)
     {
-        if (string.IsNullOrWhiteSpace(entryName))
-        {
-            throw new InvalidDataException("AF01 archive contains an empty entry name.");
-        }
-
-        var normalized = entryName.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar);
-        var segments = normalized.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries);
-        if (Path.IsPathRooted(normalized) ||
-            segments.Length == 0 ||
-            segments.Any(segment => segment is "." or ".." || segment.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0))
-        {
-            throw new InvalidDataException($"Unsafe AF01 entry path: {entryName}");
-        }
-
-        var fullRoot = Path.GetFullPath(rootDirectory);
-        var fullPath = Path.GetFullPath(Path.Combine(fullRoot, normalized));
-        var rootWithSeparator = Path.EndsInDirectorySeparator(fullRoot)
-            ? fullRoot
-            : fullRoot + Path.DirectorySeparatorChar;
-
-        if (!fullPath.StartsWith(rootWithSeparator, StringComparison.OrdinalIgnoreCase))
-        {
-            throw new InvalidDataException($"Archive entry escapes output directory: {entryName}");
-        }
-
-        return fullPath;
+        return SafePath.GetSafeDestinationPath(rootDirectory, entryName);
     }
 
-    private static FileStream CreateExtractionFile(string path, bool overwriteExisting)
+    private static void WriteExtractionFileAtomically(
+        string outputRoot,
+        string outputPath,
+        bool overwriteExisting,
+        Action<FileStream> write)
     {
-        return new FileStream(
-            path,
-            overwriteExisting ? FileMode.Create : FileMode.CreateNew,
-            FileAccess.Write,
-            FileShare.None,
-            1024 * 1024,
-            FileOptions.SequentialScan);
+        WriteExtractionPathAtomically(
+            outputRoot,
+            outputPath,
+            overwriteExisting,
+            temporaryPath =>
+            {
+                using var output = new FileStream(
+                    temporaryPath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    1024 * 1024,
+                    FileOptions.SequentialScan);
+                write(output);
+                output.Flush(flushToDisk: true);
+            });
+    }
+
+    private static void WriteExtractionPathAtomically(
+        string outputRoot,
+        string destinationPath,
+        bool overwriteExisting,
+        Action<string> write)
+    {
+        SafePath.ValidateExistingPath(outputRoot, destinationPath);
+
+        var destinationDirectory = Path.GetDirectoryName(destinationPath)
+            ?? throw new InvalidDataException($"Invalid extraction destination: {destinationPath}");
+        Directory.CreateDirectory(destinationDirectory);
+        SafePath.ValidateExistingPath(outputRoot, destinationPath);
+
+        var temporaryPath = Path.Combine(
+            destinationDirectory,
+            $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.tmp");
+
+        try
+        {
+            write(temporaryPath);
+
+            // Writer API 以路徑輸出；重新開啟暫存檔並 Flush，確保替換前已完成寫入。
+            using (var temporary = new FileStream(
+                temporaryPath,
+                FileMode.Open,
+                FileAccess.ReadWrite,
+                FileShare.None))
+            {
+                temporary.Flush(flushToDisk: true);
+            }
+
+            SafePath.ValidateExistingPath(outputRoot, destinationPath);
+
+            if (Directory.Exists(destinationPath))
+            {
+                throw new IOException($"Extraction destination is already a directory: {destinationPath}");
+            }
+
+            if (File.Exists(destinationPath))
+            {
+                if (!overwriteExisting)
+                {
+                    throw new IOException($"Extraction would overwrite an existing file: {destinationPath}");
+                }
+
+                File.Replace(temporaryPath, destinationPath, destinationBackupFileName: null);
+            }
+            else
+            {
+                File.Move(temporaryPath, destinationPath);
+            }
+        }
+        finally
+        {
+            if (File.Exists(temporaryPath))
+            {
+                File.Delete(temporaryPath);
+            }
+        }
     }
 
     private static void ValidateExtractionTargets(
@@ -660,13 +725,12 @@ public sealed class Af01ArchiveCodec
         bool overwriteExisting)
     {
         var fullRoot = Path.GetFullPath(outputDirectory);
-        if (File.Exists(fullRoot))
-        {
-            throw new IOException($"Extraction output path is an existing file: {fullRoot}");
-        }
+        SafePath.ValidateOutputRoot(fullRoot);
 
-        var comparer = StringComparer.OrdinalIgnoreCase;
-        var manifestPath = Path.Combine(fullRoot, manifestFileName);
+        var comparer = OperatingSystem.IsWindows()
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal;
+        var manifestPath = SafePath.GetSafeDestinationPath(fullRoot, manifestFileName);
         var targets = new HashSet<string>(comparer);
 
         foreach (var entryName in entryNames)
@@ -687,6 +751,8 @@ public sealed class Af01ArchiveCodec
 
         foreach (var path in targets)
         {
+            SafePath.ValidateExistingPath(fullRoot, path);
+
             if (Directory.Exists(path))
             {
                 throw new IOException($"Extraction target is already a directory: {path}");
@@ -715,6 +781,7 @@ public sealed class Af01ArchiveCodec
             }
         }
 
+        SafePath.ValidateExistingPath(fullRoot, manifestPath);
         if (Directory.Exists(manifestPath))
         {
             throw new IOException($"The reserved AF01 manifest path is already a directory: {manifestPath}");
@@ -772,7 +839,10 @@ public sealed class Af01ArchiveCodec
         var fullOutputPath = Path.GetFullPath(outputPath);
         var outputDirectory = Path.GetDirectoryName(fullOutputPath)
             ?? throw new InvalidDataException("AF01 output directory is invalid.");
+        SafePath.ValidateOutputRoot(outputDirectory);
         Directory.CreateDirectory(outputDirectory);
+        SafePath.ValidateOutputRoot(outputDirectory);
+        SafePath.ValidateExistingPath(outputDirectory, fullOutputPath);
 
         var temporaryPath = Path.Combine(
             outputDirectory,
@@ -793,6 +863,7 @@ public sealed class Af01ArchiveCodec
             }
 
             validate(temporaryPath);
+            SafePath.ValidateExistingPath(outputDirectory, fullOutputPath);
 
             if (File.Exists(fullOutputPath))
             {

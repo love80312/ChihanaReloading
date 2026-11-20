@@ -60,8 +60,7 @@ public static class KaguyaApp
                 return 0;
 
             case "--self-test":
-                Console.WriteLine("Self-test stub: core scaffolding is present.");
-                return 0;
+                return Kaguya_YaneKit.Core.SafePathSelfTest.Run();
 
             case "scr":
                 return ScrCommands.Run(args.Skip(1).ToArray(), context);
@@ -129,7 +128,7 @@ public static class KaguyaApp
         Console.WriteLine("    --workdir <dir>        Work directory (default: <tool>/workplace)");
         Console.WriteLine("    --params <params.dat>  Override params.dat path");
         Console.WriteLine("    --help                 Show this help");
-        Console.WriteLine("    --self-test            Run a tiny format scaffold check");
+        Console.WriteLine("    --self-test            Run core path and restore safety tests");
         Console.WriteLine();
         Console.WriteLine("  Script commands:");
         Console.WriteLine("    scr decompile <in> <out>");

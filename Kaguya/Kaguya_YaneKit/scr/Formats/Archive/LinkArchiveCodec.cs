@@ -21,10 +21,11 @@
 //   - PackLink6FromManifest: 按已有 manifest 恢复原始条目顺序和标志
 //   - 尾部写 u32(0) 终止符
 //
-// 安全: GetSafeOutputPath 防止路径穿越攻击
+// 安全: SafePath 统一验证输出路径；解包条目使用同目录暂存文件原子替换。
 // ============================================================================
 using System.Buffers.Binary;
 using System.Text;
+using Kaguya_YaneKit.Core;
 using Kaguya_YaneKit.Formats.Params;
 using Microsoft.Win32.SafeHandles;
 
@@ -213,6 +214,7 @@ public sealed class LinkArchiveCodec
         }
 
         Directory.CreateDirectory(outputDirectory);
+        SafePath.ValidateOutputRoot(outputDirectory);
         using var archiveHandle = File.OpenHandle(
             archivePath,
             FileMode.Open,
@@ -225,50 +227,54 @@ public sealed class LinkArchiveCodec
         Parallel.ForEach(manifest.Entries, new ParallelOptions { MaxDegreeOfParallelism = ExtractParallelism }, entry =>
         {
             var outputPath = GetSafeOutputPath(outputDirectory, entry.Name);
-            Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
             ThrowIfUnsupportedCombinedFlags(entry);
 
-            if ((entry.EntryFlags & 1) != 0)
-            {
-                var rawData = ReadExact(archiveHandle, entry.DataOffset, checked((int)entry.DataSize));
-                var unpacked = UnpackLinkLzssPayload(rawData, entry.Name);
-                using var output = CreateExtractionFile(outputPath, overwriteExisting);
-                output.Write(unpacked);
-            }
-            else if ((entry.EntryFlags & 2) != 0)
-            {
-                var rawData = ReadExact(archiveHandle, entry.DataOffset, checked((int)entry.DataSize));
-                if (!BmrDecoder.IsBmr(rawData))
+            WriteExtractionFileAtomically(
+                outputDirectory,
+                outputPath,
+                overwriteExisting,
+                output =>
                 {
-                    throw new InvalidDataException($"LINK entry is marked as BMR-compressed but payload does not start with BMR: {entry.Name}");
-                }
+                    if ((entry.EntryFlags & 1) != 0)
+                    {
+                        var rawData = ReadExact(archiveHandle, entry.DataOffset, checked((int)entry.DataSize));
+                        var unpacked = UnpackLinkLzssPayload(rawData, entry.Name);
+                        output.Write(unpacked);
+                    }
+                    else if ((entry.EntryFlags & 2) != 0)
+                    {
+                        var rawData = ReadExact(archiveHandle, entry.DataOffset, checked((int)entry.DataSize));
+                        if (!BmrDecoder.IsBmr(rawData))
+                        {
+                            throw new InvalidDataException($"LINK entry is marked as BMR-compressed but payload does not start with BMR: {entry.Name}");
+                        }
 
-                var decoder = new BmrDecoder(rawData);
-                var decompressed = decoder.Unpack();
-                using var output = CreateExtractionFile(outputPath, overwriteExisting);
-                output.Write(decompressed);
-            }
-            else
-            {
-                if (key is not null && IsEncrypted(entry))
-                {
-                    var rawData = ReadExact(archiveHandle, entry.DataOffset, checked((int)entry.DataSize));
-                    var decrypted = TransformEncryptedPayload(rawData, key, entry.Name, requireSupported: false);
-                    using var output = CreateExtractionFile(outputPath, overwriteExisting);
-                    output.Write(decrypted);
-                }
-                else
-                {
-                    using var output = CreateExtractionFile(outputPath, overwriteExisting);
-                    CopyBytes(archiveHandle, output, entry.DataOffset, entry.DataSize);
-                }
-            }
+                        var decoder = new BmrDecoder(rawData);
+                        var decompressed = decoder.Unpack();
+                        output.Write(decompressed);
+                    }
+                    else if (key is not null && IsEncrypted(entry))
+                    {
+                        var rawData = ReadExact(archiveHandle, entry.DataOffset, checked((int)entry.DataSize));
+                        var decrypted = TransformEncryptedPayload(rawData, key, entry.Name, requireSupported: false);
+                        output.Write(decrypted);
+                    }
+                    else
+                    {
+                        CopyBytes(archiveHandle, output, entry.DataOffset, entry.DataSize);
+                    }
+                });
 
             TrySetTimestamp(outputPath, entry);
             progress?.Invoke(Interlocked.Increment(ref completed), total);
         });
 
-        LinkArchiveManifestWriter.Write(Path.Combine(outputDirectory, "_link_manifest.json"), manifest);
+        var manifestPath = Path.Combine(outputDirectory, "_link_manifest.json");
+        WriteExtractionPathAtomically(
+            outputDirectory,
+            manifestPath,
+            overwriteExisting,
+            temporaryPath => LinkArchiveManifestWriter.Write(temporaryPath, manifest));
     }
 
     private static string? FindParamsPath(string archivePath)
@@ -1353,15 +1359,89 @@ public sealed class LinkArchiveCodec
         return true;
     }
 
-    private static FileStream CreateExtractionFile(string path, bool overwriteExisting)
+    private static void WriteExtractionFileAtomically(
+        string outputRoot,
+        string destinationPath,
+        bool overwriteExisting,
+        Action<Stream> writeContent)
     {
-        return new FileStream(
-            path,
-            overwriteExisting ? FileMode.Create : FileMode.CreateNew,
-            FileAccess.Write,
-            FileShare.None,
-            1024 * 1024,
-            FileOptions.SequentialScan);
+        WriteExtractionPathAtomically(
+            outputRoot,
+            destinationPath,
+            overwriteExisting,
+            temporaryPath =>
+            {
+                using var output = new FileStream(
+                    temporaryPath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    1024 * 1024,
+                    FileOptions.SequentialScan);
+                writeContent(output);
+                output.Flush(flushToDisk: true);
+            });
+    }
+
+    private static void WriteExtractionPathAtomically(
+        string outputRoot,
+        string destinationPath,
+        bool overwriteExisting,
+        Action<string> writeTemporaryFile)
+    {
+        SafePath.ValidateExistingPath(outputRoot, destinationPath);
+
+        var destinationDirectory = Path.GetDirectoryName(destinationPath)
+            ?? throw new InvalidDataException($"Invalid extraction destination: {destinationPath}");
+        Directory.CreateDirectory(destinationDirectory);
+        SafePath.ValidateExistingPath(outputRoot, destinationPath);
+
+        var temporaryPath = Path.Combine(
+            destinationDirectory,
+            $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.tmp");
+
+        try
+        {
+            writeTemporaryFile(temporaryPath);
+
+            // 確保暫存檔內容已落盤，再檢查目的路徑並提交。
+            using (var temporary = new FileStream(
+                temporaryPath,
+                FileMode.Open,
+                FileAccess.ReadWrite,
+                FileShare.None))
+            {
+                temporary.Flush(flushToDisk: true);
+            }
+
+            SafePath.ValidateExistingPath(outputRoot, destinationPath);
+            if (Directory.Exists(destinationPath))
+            {
+                throw new IOException($"Extraction destination is already a directory: {destinationPath}");
+            }
+
+            if (File.Exists(destinationPath))
+            {
+                if (!overwriteExisting)
+                {
+                    throw new IOException($"Extraction would overwrite an existing file: {destinationPath}. Use --overwrite to replace it.");
+                }
+
+                File.Replace(temporaryPath, destinationPath, destinationBackupFileName: null);
+            }
+            else
+            {
+                // File.Move 不允許覆蓋；若預檢後有其他程序建立同名檔，會安全失敗。
+                File.Move(temporaryPath, destinationPath);
+            }
+        }
+        finally
+        {
+            if (File.Exists(temporaryPath))
+            {
+                File.Delete(temporaryPath);
+            }
+        }
     }
 
     private static void ValidateExtractionTargets(
@@ -1371,15 +1451,12 @@ public sealed class LinkArchiveCodec
         bool overwriteExisting)
     {
         var fullRoot = Path.GetFullPath(outputDirectory);
-        if (File.Exists(fullRoot))
-        {
-            throw new IOException($"Extraction output path is an existing file: {fullRoot}");
-        }
+        SafePath.ValidateOutputRoot(fullRoot);
 
         var comparer = OperatingSystem.IsWindows()
             ? StringComparer.OrdinalIgnoreCase
             : StringComparer.Ordinal;
-        var manifestPath = Path.Combine(fullRoot, manifestFileName);
+        var manifestPath = SafePath.GetSafeDestinationPath(fullRoot, manifestFileName);
         var targets = new HashSet<string>(comparer);
 
         foreach (var entryName in entryNames)
@@ -1400,10 +1477,7 @@ public sealed class LinkArchiveCodec
 
         foreach (var path in targets)
         {
-            if (Directory.Exists(path))
-            {
-                throw new IOException($"Extraction target is already a directory: {path}");
-            }
+            SafePath.ValidateExistingPath(fullRoot, path);
 
             if (!overwriteExisting && File.Exists(path))
             {
@@ -1428,11 +1502,7 @@ public sealed class LinkArchiveCodec
             }
         }
 
-        if (Directory.Exists(manifestPath))
-        {
-            throw new IOException($"The reserved LINK manifest path is already a directory: {manifestPath}");
-        }
-
+        SafePath.ValidateExistingPath(fullRoot, manifestPath);
         if (!overwriteExisting && File.Exists(manifestPath))
         {
             throw new IOException(
@@ -1489,12 +1559,17 @@ public sealed class LinkArchiveCodec
         var fullOutputPath = Path.GetFullPath(outputPath);
         var outputDirectory = Path.GetDirectoryName(fullOutputPath)
             ?? throw new InvalidDataException("LINK output directory is invalid.");
+
+        SafePath.ValidateOutputRoot(outputDirectory);
         if (Directory.Exists(fullOutputPath))
         {
             throw new IOException($"Archive output path is a directory: {fullOutputPath}");
         }
 
         Directory.CreateDirectory(outputDirectory);
+        SafePath.ValidateOutputRoot(outputDirectory);
+        SafePath.ValidateExistingPath(outputDirectory, fullOutputPath);
+
         var temporaryPath = Path.Combine(
             outputDirectory,
             $".{Path.GetFileName(fullOutputPath)}.{Guid.NewGuid():N}.tmp");
@@ -1514,6 +1589,7 @@ public sealed class LinkArchiveCodec
             }
 
             validate(temporaryPath);
+            SafePath.ValidateExistingPath(outputDirectory, fullOutputPath);
 
             if (File.Exists(fullOutputPath))
             {
@@ -1552,39 +1628,7 @@ public sealed class LinkArchiveCodec
 
     private static string GetSafeOutputPath(string rootDirectory, string entryName)
     {
-        if (string.IsNullOrWhiteSpace(entryName))
-        {
-            throw new InvalidDataException("LINK archive contains an empty entry name.");
-        }
-
-        var normalized = entryName.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar);
-        if (Path.IsPathRooted(normalized))
-        {
-            throw new InvalidDataException($"Unsafe LINK entry path: {entryName}");
-        }
-
-        var parts = normalized.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries);
-        if (parts.Length == 0 ||
-            parts.Any(part => part is "." or ".." || part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0))
-        {
-            throw new InvalidDataException($"Unsafe LINK entry path: {entryName}");
-        }
-
-        var fullRoot = Path.GetFullPath(rootDirectory);
-        var fullPath = Path.GetFullPath(Path.Combine(fullRoot, Path.Combine(parts)));
-        var rootPrefix = Path.EndsInDirectorySeparator(fullRoot)
-            ? fullRoot
-            : fullRoot + Path.DirectorySeparatorChar;
-        var comparison = OperatingSystem.IsWindows()
-            ? StringComparison.OrdinalIgnoreCase
-            : StringComparison.Ordinal;
-
-        if (!fullPath.StartsWith(rootPrefix, comparison))
-        {
-            throw new InvalidDataException($"LINK entry escapes output directory: {entryName}");
-        }
-
-        return fullPath;
+        return SafePath.GetSafeDestinationPath(rootDirectory, entryName);
     }
 
     private static void TrySetTimestamp(string path, LinkArchiveEntry entry)
