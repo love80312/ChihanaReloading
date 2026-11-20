@@ -1,5 +1,5 @@
 
-# Kaguya_YaneKit
+# Kaguya_YaneKit byＡＩ
 
 > `Kaguya_YaneKit` 是面向 `アトリエかぐや` 引擎資源的工具。
 >
