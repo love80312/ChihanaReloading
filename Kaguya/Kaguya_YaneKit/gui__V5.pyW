@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import queue
 import re
@@ -429,7 +430,12 @@ class KaguyaGui:
         self.current_operation: dict[str, Any] | None = None
         self.field_vars: dict[str, tk.Variable] = {}
         self.field_widgets: dict[str, tk.Widget] = {}
+        self.field_labels: dict[str, ttk.Label] = {}
         self.field_defs: dict[str, dict[str, Any]] = {}
+        # v05+ params.dat 固定 UTF-16LE；切換版本時保留使用者選過的舊版編碼。
+        self._params_encoding_fixed_keys: set[str] = set()
+        self._params_encoding_saved_values: dict[str, str] = {}
+        self._params_encoding_preferences: dict[str, str] = {}
         self.category_var = tk.StringVar(value=CATEGORIES[0])
         self.operation_var = tk.StringVar()
         self.exe_var = tk.StringVar(value=str(self._find_exe() or ""))
@@ -599,8 +605,128 @@ class KaguyaGui:
         self._refresh_command_preview()
 
     def _on_operation_field_change(self) -> None:
+        self._update_params_encoding_controls()
         self._update_params_hint()
         self._refresh_command_preview()
+
+    @staticmethod
+    def _params_encoding_mode_from_header(header: Any) -> str | None:
+        """依 params.dat Header 判斷舊 ANSI 或 v05+ UTF-16LE 字串格式。"""
+        if not isinstance(header, str):
+            return None
+        match = re.match(r"^\[SCR-PARAMS\]v(02|03|04|05(?:\.\d+)?)", header.strip())
+        if not match:
+            return None
+        version = match.group(1)
+        if version in {"02", "03", "04"}:
+            return "legacy"
+        if version == "05" or version.startswith("05."):
+            return "utf16"
+        return None
+
+    def _detect_params_encoding_mode(self) -> str | None:
+        """讀取 params 操作來源的版本標頭；import-json 則讀取 JSON 的 Header。"""
+        operation = self.current_operation
+        if not operation or operation.get("command", [])[:1] != ["params"]:
+            return None
+        if not ({"read_encoding", "write_encoding"} & set(self.field_vars)):
+            return None
+
+        source_var = self.field_vars.get("src")
+        source_text = str(source_var.get()).strip() if source_var is not None else ""
+        if not source_text:
+            return None
+
+        source_path = Path(source_text).expanduser()
+        if not source_path.is_file():
+            return None
+
+        try:
+            command = operation.get("command", [])
+            if command[:2] == ["params", "import-json"]:
+                with source_path.open("r", encoding="utf-8-sig") as stream:
+                    document = json.load(stream)
+                if not isinstance(document, dict):
+                    return None
+                return self._params_encoding_mode_from_header(document.get("Header"))
+
+            with source_path.open("rb") as stream:
+                header_text = stream.read(32).decode("ascii", errors="ignore")
+            return self._params_encoding_mode_from_header(header_text)
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+            return None
+
+    def _remember_params_encoding_preferences(self) -> None:
+        """記住目前舊版 params 操作的選擇，供切換操作後恢復。"""
+        operation = self.current_operation
+        if not operation or operation.get("command", [])[:1] != ["params"]:
+            return
+        for key in ("read_encoding", "write_encoding"):
+            if key not in self.field_vars or key in self._params_encoding_fixed_keys:
+                continue
+            try:
+                value = str(self._field_value(key))
+            except (KeyError, tk.TclError):
+                continue
+            if value:
+                self._params_encoding_preferences[key] = value
+
+    def _update_params_encoding_controls(self) -> None:
+        """v05+ 固定 UTF-16LE；v02-v04 恢復可選編碼並保留原選擇。"""
+        mode = self._detect_params_encoding_mode()
+        fixed = mode == "utf16"
+
+        for key in ("read_encoding", "write_encoding"):
+            if key not in self.field_vars or key not in self.field_widgets:
+                continue
+
+            variable = self.field_vars[key]
+            widget = self.field_widgets[key]
+            spec = self.field_defs[key]
+            label_widget = self.field_labels.get(key)
+
+            if fixed:
+                if key not in self._params_encoding_fixed_keys:
+                    current_value = str(self._field_value(key))
+                    if current_value:
+                        self._params_encoding_preferences[key] = current_value
+                    self._params_encoding_saved_values[key] = current_value
+                    self._params_encoding_fixed_keys.add(key)
+
+                widget.configure(
+                    values=["固定 UTF-16LE（不適用）"],
+                    state="disabled",
+                )
+                variable.set("固定 UTF-16LE（不適用）")
+                if label_widget is not None:
+                    label_widget.configure(text=f"{spec['label']}（固定 UTF-16LE）")
+                continue
+
+            if key in self._params_encoding_fixed_keys:
+                choices = spec.get("choices", [])
+                values = [f"{name}  [{value}]" for name, value in choices]
+                saved_value = self._params_encoding_preferences.get(
+                    key,
+                    self._params_encoding_saved_values.get(key, spec.get("default", "")),
+                )
+                shown_value = next(
+                    (f"{name}  [{value}]" for name, value in choices if value == saved_value),
+                    next(
+                        (
+                            f"{name}  [{value}]"
+                            for name, value in choices
+                            if value == spec.get("default")
+                        ),
+                        values[0] if values else "",
+                    ),
+                )
+                widget.configure(values=values, state="readonly")
+                variable.set(shown_value)
+                self._params_encoding_fixed_keys.discard(key)
+                self._params_encoding_saved_values.pop(key, None)
+
+            if label_widget is not None:
+                label_widget.configure(text=spec["label"])
 
     def _update_params_hint(self) -> None:
         """顯示可預期的 params.dat 搜尋路徑；不冒充 CLI 已成功載入。"""
@@ -745,6 +871,7 @@ class KaguyaGui:
         self._show_operation(self.category_ops[selected[0]])
 
     def _show_operation(self, operation: dict[str, Any]) -> None:
+        self._remember_params_encoding_preferences()
         self.current_operation = operation
         self.form_title.configure(text=operation["title"])
         self.description_label.configure(text=operation["description"])
@@ -752,10 +879,14 @@ class KaguyaGui:
             child.destroy()
         self.field_vars.clear()
         self.field_widgets.clear()
+        self.field_labels.clear()
+        self._params_encoding_fixed_keys.clear()
+        self._params_encoding_saved_values.clear()
         self.field_defs = {f["key"]: f for f in operation["fields"]}
         row = 0
         for spec in operation["fields"]:
             row = self._create_field(row, spec) + 1
+        self._update_params_encoding_controls()
         self._update_params_hint()
         self._refresh_command_preview()
 
@@ -770,8 +901,14 @@ class KaguyaGui:
             self.field_widgets[key] = widget
             return row
 
-        ttk.Label(self.form_area, text=label, width=31).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=5)
+        label_widget = ttk.Label(self.form_area, text=label, width=31)
+        label_widget.grid(row=row, column=0, sticky="w", padx=(0, 8), pady=5)
+        self.field_labels[key] = label_widget
         default = spec["default"]
+        if (self.current_operation is not None
+                and self.current_operation.get("command", [])[:1] == ["params"]
+                and key in self._params_encoding_preferences):
+            default = self._params_encoding_preferences[key]
         if kind == "choice":
             var = tk.StringVar(value=default)
             values = [f"{name}  [{value}]" for name, value in spec["choices"]]
@@ -815,6 +952,9 @@ class KaguyaGui:
             self._refresh_command_preview()
 
     def _field_value(self, key: str) -> Any:
+        # v05+ 編碼欄位僅顯示固定 UTF-16LE，不傳入 CLI。
+        if key in self._params_encoding_fixed_keys:
+            return ""
         variable = self.field_vars[key]
         value = variable.get()
         spec = self.field_defs[key]
@@ -870,6 +1010,9 @@ class KaguyaGui:
         for spec in operation["fields"]:
             key = spec["key"]
             kind = spec["kind"]
+            # v05+ 的編碼欄位固定 UTF-16LE，略過必填欄位檢查。
+            if key in self._params_encoding_fixed_keys:
+                continue
             raw_value = str(values.get(key, "")).strip()
             if kind == "check":
                 continue
