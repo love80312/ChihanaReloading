@@ -52,7 +52,7 @@ public static class ArchiveCommands
                 codec.Extract(
                     archivePath,
                     outputDirectory,
-                    paramsPath ?? context?.ParamsPath,
+                    paramsPath ?? context?.LinkParamsLookupPath,
                     contextKey,
                     decrypt,
                     overwriteExisting: overwriteExisting);

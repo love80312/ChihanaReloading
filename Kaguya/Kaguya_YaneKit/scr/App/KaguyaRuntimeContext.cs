@@ -12,6 +12,14 @@ public sealed class KaguyaRuntimeContext
     public string GameRoot { get; init; } = "";
     public string WorkDirectory { get; init; } = "";
     public string? ParamsPath { get; init; }
+    public bool HasExplicitGameRoot { get; init; }
+
+    // LINK codec 會在 paramsPath 為 null 時自行搜尋封包目錄與目前目錄。
+    // 使用者明確指定 --game-root 時，即使該目錄沒有 params.dat，也必須傳入
+    // 該遊戲預期的 params.dat 路徑，避免誤讀其他遊戲的金鑰。
+    public string? LinkParamsLookupPath => ParamsPath ??
+        (HasExplicitGameRoot ? Path.Combine(GameRoot, "params.dat") : null);
+
     public string? TblstrArchivePath { get; init; }
     public ParamsDatDocument? Params { get; init; }
     public byte[]? LinkEncryptionKey { get; init; }
@@ -55,12 +63,22 @@ public sealed class KaguyaRuntimeContext
             linkKey = Convert.FromBase64String(document.GameSystem.RawBlob.LinkXorKeyBase64);
         }
 
+        // LinkArchiveCodec 目前以 null encryptionKey 表示「允許自行搜尋 params.dat」。
+        // 明確指定 gameRoot 卻找不到 params.dat 時，使用非 null 的空 key 作為 fail-closed
+        // sentinel，讓所有既有 LINK 呼叫端（包含互動模式）都不會退回其他遊戲目錄搜尋。
+        // 真正需要解密時，codec 會因空 key 而拒絕操作；raw extract 不受影響。
+        if (resolvedParamsPath is null && !string.IsNullOrWhiteSpace(gameRoot))
+        {
+            linkKey = Array.Empty<byte>();
+        }
+
         return new KaguyaRuntimeContext
         {
             ToolDirectory = toolDirectory,
             GameRoot = resolvedGameRoot,
             WorkDirectory = resolvedWorkDirectory,
             ParamsPath = resolvedParamsPath,
+            HasExplicitGameRoot = !string.IsNullOrWhiteSpace(gameRoot),
             TblstrArchivePath = resolvedTblstrArchivePath,
             Params = document,
             LinkEncryptionKey = linkKey

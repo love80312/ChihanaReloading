@@ -83,7 +83,7 @@ public static class LinkCommands
         var codec = new LinkArchiveCodec();
         var stopwatch = Stopwatch.StartNew();
         var contextKey = SelectContextEncryptionKey(paramsPath, context?.LinkEncryptionKey);
-        codec.Extract(args[1], args[2], paramsPath ?? context?.ParamsPath, contextKey, decrypt);
+        codec.Extract(args[1], args[2], paramsPath ?? context?.LinkParamsLookupPath, contextKey, decrypt);
         using var stream = File.OpenRead(args[1]);
         var manifest = codec.ReadManifest(stream);
         Console.WriteLine($"Extracted {manifest.Entries.Count} entries to {args[2]} in {stopwatch.Elapsed.TotalSeconds:F2}s");

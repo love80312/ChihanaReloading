@@ -26,7 +26,7 @@
 
 `--self-test` 中的合成資料及路徑安全測試用來驗證程式邏輯，不屬於任何商業遊戲樣本的 T1～T5 報告。CI 編譯成功及 synthetic self-test 通過，也不代表真實封包已完成 T3、T4 或 T5。
 
-LINK 加密測試需要對應遊戲的 `params.dat` 金鑰。請勿將商業遊戲原始 `params.dat`、金鑰或受版權保護的完整資源上傳到公開 issue；可記錄測試環境、匿名化雜湊及可重現的錯誤訊息。
+LINK 加密測試需要對應遊戲的 `params.dat` 金鑰。當使用者明確指定 `--game-root` 時，即使該目錄沒有 `params.dat`，也不得退回封包目錄或目前工作目錄搜尋其他遊戲的金鑰；Runtime Context 會以非 null 空 key 阻止 codec 的自動搜尋，並由自我測試確認。此 sentinel 只用於 fail-closed 控制，不能當作有效加密金鑰。請勿將商業遊戲原始 `params.dat`、金鑰或受版權保護的完整資源上傳到公開 issue；可記錄測試環境、匿名化雜湊及可重現的錯誤訊息。
 
 ## 建議測試報告範本
 

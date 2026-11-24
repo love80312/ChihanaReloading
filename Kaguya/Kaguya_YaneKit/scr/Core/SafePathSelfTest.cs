@@ -35,6 +35,7 @@ internal static class SafePathSelfTest
             Console.WriteLine("PASS: LINK/AF01 atomic extraction keeps old files on write failure.");
             Console.WriteLine("PASS: Runtime Context can retain params.dat path without parsing its contents.");
             Console.WriteLine("PASS: Explicit LINK --params takes precedence over a cached context key.");
+            Console.WriteLine("PASS: Explicit game root without params.dat disables cross-game LINK key fallback.");
             Console.WriteLine("PASS: Restorer atomic replacement, replenish, and timestamps.");
             Console.WriteLine("All Kaguya_YaneKit core self-tests passed.");
             return 0;
@@ -259,6 +260,37 @@ internal static class SafePathSelfTest
             "Lazy Runtime Context did not retain the explicit params.dat path.");
         Assert(context.Params is null, "Lazy Runtime Context unexpectedly parsed params.dat.");
         Assert(context.LinkEncryptionKey is null, "Lazy Runtime Context unexpectedly loaded a LINK key.");
+
+        // 明確指定的遊戲根目錄沒有 params.dat 時，LINK 不可退回搜尋封包目錄，
+        // 否則可能誤用另一款遊戲的 XOR key。
+        var gameRootWithoutParams = Path.Combine(testRoot, "explicit-game-without-params");
+        Directory.CreateDirectory(gameRootWithoutParams);
+        var noParamsContext = KaguyaRuntimeContext.Create(
+            gameRootWithoutParams,
+            Path.Combine(testRoot, "explicit-game-without-params-work"),
+            loadParams: false);
+        var expectedLookupPath = Path.Combine(gameRootWithoutParams, "params.dat");
+
+        Assert(noParamsContext.HasExplicitGameRoot, "Runtime Context did not remember the explicit game root.");
+        Assert(noParamsContext.ParamsPath is null, "Runtime Context unexpectedly found params.dat in an empty game root.");
+        Assert(!File.Exists(expectedLookupPath), "The explicit-game-root self-test unexpectedly created params.dat.");
+        Assert(
+            PathComparer.Equals(expectedLookupPath, noParamsContext.LinkParamsLookupPath ?? ""),
+            "LINK lookup path did not stay pinned to the explicitly selected game root.");
+        Assert(
+            noParamsContext.LinkEncryptionKey is { Length: 0 },
+            "An explicit game root without params.dat must suppress LINK codec fallback with an empty-key sentinel.");
+
+        var implicitRootContext = KaguyaRuntimeContext.Create(
+            workDirectory: Path.Combine(testRoot, "implicit-game-root-work"),
+            loadParams: false);
+        Assert(!implicitRootContext.HasExplicitGameRoot, "Runtime Context incorrectly marked an implicit game root as explicit.");
+        Assert(
+            PathComparer.Equals(implicitRootContext.ParamsPath ?? "", implicitRootContext.LinkParamsLookupPath ?? ""),
+            "Implicit game-root lookup path should preserve the normal params.dat discovery result.");
+        Assert(
+            implicitRootContext.ParamsPath is not null || implicitRootContext.LinkEncryptionKey is null,
+            "An implicit game root without a discovered params.dat must not disable archive-directory search.");
     }
 
     private static void TestLinkParamsKeySelection()

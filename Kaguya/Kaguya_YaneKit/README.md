@@ -11,7 +11,7 @@
 | --- | --- |
 | 工具名稱 | `Kaguya_YaneKit` |
 | 目標引擎 | `アトリエかぐや` 使用的 Yane／Kaguya 系資源格式 |
-| 目前版本 | Ver1.0.0 |
+| 版本狀態 | 開發版（尚未正式發行） |
 | 主要測試範圍 | BARE＆BUNNY 分社樣本及其他 AF01 樣本 |
 | 執行環境 | Windows x64、.NET 8 |
 | 主要功能 | LINK／AF01 解包與回封、`params.dat` 解析與回封、`message.dat` 匯入匯出、`.scr` HLS 高階解析與回編、低階 SCRASM、TBLSTR／TBL 文字處理、圖片轉換與回封、CG/SP 合成、PE 字串處理 |
@@ -111,6 +111,7 @@ Kaguya_YaneKit.exe archive_pack <input-dir> <manifest.json> <output.arc> [--comp
 - `--params <params.dat>` 可指定 LINK 解密所使用的參數檔。
 - LINK 清單、驗證及 raw 解包不需要解析 `params.dat` 的內容；只有實際解密或重新加密時才會讀取金鑰。
 - LINK 明確指定 `--params` 時，該檔案的金鑰優先，不會沿用另一個遊戲預先載入的金鑰。
+- 明確指定 `--game-root` 時，LINK 只會使用該遊戲根目錄的 `params.dat`；若不存在，工具會拒絕需要金鑰的操作，不會再從封包目錄或目前工作目錄尋找其他遊戲的金鑰。raw 解包不受影響。
 
 回封注意事項：
 
@@ -519,11 +520,12 @@ Kaguya_YaneKit.exe --self-test
 | 暫存檔清理 | 確認失敗或完成後不殘留暫存檔 |
 | Runtime Context 延遲解析 | 只保留 params.dat 路徑，不讀取或解析內容 |
 | LINK 金鑰選擇 | 明確指定 `--params` 時，不沿用 context 中的快取金鑰 |
+| 明確遊戲根目錄金鑰隔離 | 指定 `--game-root` 且該目錄沒有 params.dat 時，不退回封包目錄或目前目錄尋找其他金鑰 |
 | Restorer | 測試圖片還原、補充、原子替換及時間戳 |
 
 **測試範圍說明：**
 
-`--self-test` 是核心安全性、Runtime Context 路徑選擇及檔案操作測試，不是完整的遊戲封包整合測試。LINK 金鑰選擇測試驗證的是參數優先順序，不代表已使用商業遊戲的加密資料完成解密測試。
+`--self-test` 是核心安全性、Runtime Context 路徑選擇及檔案操作測試，不是完整的遊戲封包整合測試。LINK 金鑰選擇與遊戲根目錄隔離測試驗證的是路徑／參數選擇規則，不代表已使用商業遊戲的加密資料完成解密測試。
 
 通過自我測試不代表已經完成所有真實 LINK／AF01 樣本的解包、修改、回封、重新解包及遊戲內載入驗證。實際操作仍應使用備份封包進行閉環比對。
 
