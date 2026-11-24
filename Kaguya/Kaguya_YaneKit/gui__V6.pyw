@@ -418,10 +418,13 @@ class KaguyaGui:
         # 右側常駐執行紀錄需要一定寬度；視螢幕解析度調整初始尺寸。
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
-        width = min(1480, max(900, screen_w - 60))
-        height = min(900, max(620, screen_h - 100))
+        min_width = min(900, max(640, screen_w - 40))
+        min_height = min(620, max(480, screen_h - 80))
+        width = min(1480, max(min_width, screen_w - 60))
+        height = min(900, max(min_height, screen_h - 100))
         self.root.geometry(f"{width}x{height}")
-        self.root.minsize(min(width, screen_w), min(height, screen_h))
+        # 初始尺寸不是最小尺寸；允許使用者縮小視窗，讓各欄位重新分配空間。
+        self.root.minsize(min_width, min_height)
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.worker: threading.Thread | None = None
         self.process: subprocess.Popen[str] | None = None
@@ -432,6 +435,9 @@ class KaguyaGui:
         self.field_widgets: dict[str, tk.Widget] = {}
         self.field_labels: dict[str, ttk.Label] = {}
         self.field_defs: dict[str, dict[str, Any]] = {}
+        self.help_labels: list[ttk.Label] = []
+        self._last_wraplengths: dict[str, int] = {}
+        self._wrap_update_pending = False
         # v05+ params.dat 固定 UTF-16LE；切換版本時保留使用者選過的舊版編碼。
         self._params_encoding_fixed_keys: set[str] = set()
         self._params_encoding_saved_values: dict[str, str] = {}
@@ -496,9 +502,12 @@ class KaguyaGui:
         self._path_row(global_frame, 0, "遊戲根目錄", self.game_root_var, "dir")
         self._path_row(global_frame, 1, "工作目錄", self.workdir_var, "save_dir")
         self._path_row(global_frame, 2, "params.dat", self.params_var, "file", FILE_DAT)
-        ttk.Label(global_frame, textvariable=self.params_hint_var, foreground="#52677a",
-                  wraplength=1100, justify="left").grid(
-                      row=3, column=1, columnspan=2, sticky="w", pady=(4, 1))
+        self.params_hint_label = ttk.Label(
+            global_frame, textvariable=self.params_hint_var, foreground="#52677a",
+            wraplength=1100, justify="left")
+        self.params_hint_label.grid(
+            row=3, column=1, columnspan=2, sticky="ew", pady=(4, 1))
+        global_frame.bind("<Configure>", self._schedule_wrap_update, add="+")
 
         # 主操作區與執行紀錄採左右分割；紀錄面板不再被擠到視窗底部。
         main_panes = ttk.Panedwindow(outer, orient="horizontal")
@@ -516,7 +525,8 @@ class KaguyaGui:
             if total_width <= 1:
                 self.root.after(100, set_initial_log_width)
                 return
-            log_width = min(420, max(300, int(total_width * 0.30)))
+            # 讓紀錄區維持約四分之一寬度，避免中央操作表單被壓縮。
+            log_width = min(400, max(270, int(total_width * 0.26)))
             sash_position = max(1, total_width - log_width)
             main_panes.sashpos(0, sash_position)
 
@@ -525,11 +535,11 @@ class KaguyaGui:
         # 左側：功能導覽與操作欄位。
         work_panes = ttk.Panedwindow(work_area, orient="horizontal")
         work_panes.pack(fill="both", expand=True)
-        nav = ttk.Frame(work_panes, padding=(0, 0, 8, 0), width=220)
+        nav = ttk.Frame(work_panes, padding=(0, 0, 8, 0), width=190)
         content = ttk.Frame(work_panes)
         work_panes.add(nav, weight=0)
         work_panes.add(content, weight=1)
-        nav.configure(width=220)
+        nav.configure(width=190)
 
         ttk.Label(nav, text="功能分類", style="Section.TLabel").pack(anchor="w", pady=(2, 5))
         self.category_list = tk.Listbox(
@@ -543,7 +553,7 @@ class KaguyaGui:
         ttk.Label(nav, text="操作項目", style="Section.TLabel").pack(anchor="w", pady=(12, 5))
         self.operation_list = tk.Listbox(
             nav, exportselection=False, activestyle="dotbox",
-            font=("Microsoft JhengHei UI", 9), relief="solid", borderwidth=1)
+            font=("Microsoft JhengHei UI", 10), relief="solid", borderwidth=1)
         self.operation_list.pack(fill="both", expand=True)
         self.operation_list.bind("<<ListboxSelect>>", self._on_operation_select)
 
@@ -553,15 +563,30 @@ class KaguyaGui:
         self.form_title = ttk.Label(self.form_scroll.inner, text="請選擇左側功能", style="Header.TLabel")
         self.form_title.pack(anchor="w", pady=(4, 8))
         self.description_label = ttk.Label(
-            self.form_scroll.inner, text="", wraplength=700, foreground="#555555")
+            self.form_scroll.inner, text="", wraplength=700, foreground="#964909",font=("Microsoft JhengHei UI", 11))
         self.description_label.pack(anchor="w", fill="x", pady=(0, 12))
         self.form_area = ttk.Frame(self.form_scroll.inner)
         self.form_area.pack(fill="x", expand=True)
+        self.form_scroll.bind("<Configure>", self._schedule_wrap_update, add="+")
+        self.form_scroll.inner.bind("<Configure>", self._schedule_wrap_update, add="+")
+        self.form_area.bind("<Configure>", self._schedule_wrap_update, add="+")
 
         command_frame = ttk.LabelFrame(work_area, text="即將執行的命令", padding=6)
         command_frame.pack(fill="x", pady=(8, 6))
-        ttk.Label(command_frame, textvariable=self.command_var, wraplength=900,
-                  foreground="#555555", justify="left").pack(anchor="w", fill="x")
+        command_text_frame = ttk.Frame(command_frame)
+        command_text_frame.pack(fill="x", expand=True)
+        self.command_text = tk.Text(
+            command_text_frame, height=3, wrap="word", font=("Consolas", 10),
+            foreground="#555555", selectbackground="#365a7a",
+            relief="solid", borderwidth=1, padx=6, pady=4,
+            undo=False, state="disabled")
+        command_scroll = ttk.Scrollbar(
+            command_text_frame, orient="vertical", command=self.command_text.yview)
+        self.command_text.configure(yscrollcommand=command_scroll.set)
+        self.command_text.pack(side="left", fill="both", expand=True)
+        command_scroll.pack(side="right", fill="y")
+        self.command_text.bind("<Control-a>", self._select_all_command)
+        self.command_text.bind("<Control-A>", self._select_all_command)
 
         buttons = ttk.Frame(work_area)
         buttons.pack(fill="x", pady=(0, 2))
@@ -585,7 +610,7 @@ class KaguyaGui:
         log_text_frame = ttk.Frame(log_frame)
         log_text_frame.pack(fill="both", expand=True)
         self.log = tk.Text(
-            log_text_frame, width=50, height=20, wrap="word", font=("Consolas", 9),
+            log_text_frame, width=50, height=20, wrap="word", font=("Consolas", 12),
             background="#171a1f", foreground="#d9e0e8", insertbackground="white",
             selectbackground="#365a7a", relief="flat", padx=7, pady=6,
             undo=False, state="normal")
@@ -599,6 +624,74 @@ class KaguyaGui:
         self.log.bind("<Control-a>", self._select_all_log)
         self.log.bind("<Control-A>", self._select_all_log)
         self._log("GUI 已啟動。選擇左側功能後，設定參數並執行。", "info")
+        self._schedule_wrap_update()
+
+    def _schedule_wrap_update(self, _event: tk.Event | None = None) -> None:
+        """將換行寬度更新合併到 idle，避免 Configure 事件反覆重入。"""
+        if self._wrap_update_pending:
+            return
+        self._wrap_update_pending = True
+        try:
+            self.root.after_idle(self._update_wraplengths)
+        except tk.TclError:
+            self._wrap_update_pending = False
+
+    def _update_wraplengths(self) -> None:
+        self._wrap_update_pending = False
+        targets: list[tuple[str, tk.Widget, int]] = []
+        widgets: list[tuple[str, tk.Widget]] = [
+            ("params_hint", getattr(self, "params_hint_label", None)),
+            ("description", getattr(self, "description_label", None)),
+        ]
+        widgets.extend((f"help_{index}", label) for index, label in enumerate(self.help_labels))
+        for key, widget in widgets:
+            if widget is None:
+                continue
+            try:
+                if not widget.winfo_exists():
+                    continue
+                width = widget.winfo_width()
+                if width <= 1:
+                    continue
+                # 留出內距及可能的捲軸寬度；不讓小視窗的提示文字被硬性 700/1100px 限制。
+                wraplength = max(80, min(1400, width - 18))
+                targets.append((key, widget, wraplength))
+            except tk.TclError:
+                continue
+
+        for key, widget, wraplength in targets:
+            if self._last_wraplengths.get(key) == wraplength:
+                continue
+            try:
+                widget.configure(wraplength=wraplength)
+                self._last_wraplengths[key] = wraplength
+            except tk.TclError:
+                self._last_wraplengths.pop(key, None)
+
+    def _set_command_preview(self, text: str) -> None:
+        """同步保存命令字串並更新可選取的多行預覽框。"""
+        self.command_var.set(text)
+        if not hasattr(self, "command_text"):
+            return
+        try:
+            self.command_text.configure(state="normal")
+            self.command_text.delete("1.0", "end")
+            self.command_text.insert("1.0", text)
+            self.command_text.configure(state="disabled")
+            self.command_text.yview_moveto(0)
+        except tk.TclError:
+            pass
+
+    def _select_all_command(self, _event: tk.Event | None = None) -> str:
+        try:
+            self.command_text.configure(state="normal")
+            self.command_text.tag_add("sel", "1.0", "end-1c")
+            self.command_text.mark_set("insert", "1.0")
+            self.command_text.see("insert")
+            self.command_text.configure(state="disabled")
+        except tk.TclError:
+            pass
+        return "break"
 
     def _on_global_path_change(self) -> None:
         self._update_params_hint()
@@ -880,6 +973,11 @@ class KaguyaGui:
         self.field_vars.clear()
         self.field_widgets.clear()
         self.field_labels.clear()
+        self.help_labels.clear()
+        self._last_wraplengths = {
+            key: value for key, value in self._last_wraplengths.items()
+            if key in {"params_hint", "description"}
+        }
         self._params_encoding_fixed_keys.clear()
         self._params_encoding_saved_values.clear()
         self.field_defs = {f["key"]: f for f in operation["fields"]}
@@ -889,6 +987,7 @@ class KaguyaGui:
         self._update_params_encoding_controls()
         self._update_params_hint()
         self._refresh_command_preview()
+        self._schedule_wrap_update()
 
     def _create_field(self, row: int, spec: dict[str, Any]) -> int:
         key, label, kind = spec["key"], spec["label"], spec["kind"]
@@ -932,8 +1031,9 @@ class KaguyaGui:
         self.field_vars[key] = var
         self.field_widgets[key] = widget
         if spec.get("help"):
-            help_label = ttk.Label(self.form_area, text=spec["help"], foreground="#777777", wraplength=700)
-            help_label.grid(row=row + 1, column=1, columnspan=2, sticky="w", pady=(0, 3))
+            help_label = ttk.Label(self.form_area, text=spec["help"], foreground="#777777", wraplength=700, font=("Microsoft JhengHei UI", 14))
+            help_label.grid(row=row + 1, column=1, columnspan=2, sticky="ew", pady=(0, 3))
+            self.help_labels.append(help_label)
             self.form_area.columnconfigure(1, weight=1)
             return row + 1
         self.form_area.columnconfigure(1, weight=1)
@@ -1326,9 +1426,9 @@ class KaguyaGui:
                 preview = subprocess.list2cmdline(commands[0])
             else:
                 preview = "\n&& ".join(subprocess.list2cmdline(command) for command in commands)
-            self.command_var.set(preview)
+            self._set_command_preview(preview)
         except Exception as exc:
-            self.command_var.set(f"參數尚未完整：{exc}")
+            self._set_command_preview(f"參數尚未完整：{exc}")
 
     def _run_operation(self) -> None:
         if self.worker and self.worker.is_alive():
@@ -1343,9 +1443,9 @@ class KaguyaGui:
             exe_dir = str(Path(commands[0][0]).parent)
             cwd = exe_dir
             if len(commands) == 1:
-                self.command_var.set(subprocess.list2cmdline(commands[0]))
+                self._set_command_preview(subprocess.list2cmdline(commands[0]))
             else:
-                self.command_var.set("\n&& ".join(subprocess.list2cmdline(command) for command in commands))
+                self._set_command_preview("\n&& ".join(subprocess.list2cmdline(command) for command in commands))
         except Exception as exc:
             messagebox.showerror("無法執行", str(exc))
             return
