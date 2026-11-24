@@ -1,10 +1,11 @@
 // ============================================================================
 // SafePathSelfTest.cs
-// --self-test 實際驗證安全路徑、LINK/AF01 路徑委派，以及 Restorer 檔案還原。
+// --self-test 實際驗證安全路徑、LINK/AF01 路徑委派、Runtime Context 延遲解析，以及 Restorer 檔案還原。
 // ============================================================================
 using System.Reflection;
 using System.Runtime.ExceptionServices;
 using System.Text.Json;
+using Kaguya_YaneKit.App;
 using Kaguya_YaneKit.Formats.Archive;
 using Kaguya_YaneKit.Formats.Picture;
 
@@ -25,11 +26,15 @@ internal static class SafePathSelfTest
             TestSafePathValidation(testRoot);
             TestArchivePathDelegation(testRoot);
             TestArchiveAtomicReplacement(testRoot);
+            TestRuntimeContextLazyParams(testRoot);
+            TestLinkParamsKeySelection();
             TestRestoreAndReplenish(testRoot);
 
             Console.WriteLine("PASS: SafePath traversal, invalid-name, and reparse-point checks.");
             Console.WriteLine("PASS: LINK/AF01 extraction path validation delegates.");
             Console.WriteLine("PASS: LINK/AF01 atomic extraction keeps old files on write failure.");
+            Console.WriteLine("PASS: Runtime Context can retain params.dat path without parsing its contents.");
+            Console.WriteLine("PASS: Explicit LINK --params takes precedence over a cached context key.");
             Console.WriteLine("PASS: Restorer atomic replacement, replenish, and timestamps.");
             Console.WriteLine("All Kaguya_YaneKit core self-tests passed.");
             return 0;
@@ -234,6 +239,36 @@ internal static class SafePathSelfTest
             ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
             throw;
         }
+    }
+
+    private static void TestRuntimeContextLazyParams(string testRoot)
+    {
+        var gameRoot = Path.Combine(testRoot, "lazy-params-game");
+        Directory.CreateDirectory(gameRoot);
+        var invalidParamsPath = Path.Combine(gameRoot, "params.dat");
+        File.WriteAllBytes(invalidParamsPath, [0x00, 0x01, 0x02, 0x03]);
+
+        var context = KaguyaRuntimeContext.Create(
+            gameRoot,
+            Path.Combine(testRoot, "lazy-params-work"),
+            invalidParamsPath,
+            loadParams: false);
+
+        Assert(
+            PathComparer.Equals(Path.GetFullPath(invalidParamsPath), context.ParamsPath ?? ""),
+            "Lazy Runtime Context did not retain the explicit params.dat path.");
+        Assert(context.Params is null, "Lazy Runtime Context unexpectedly parsed params.dat.");
+        Assert(context.LinkEncryptionKey is null, "Lazy Runtime Context unexpectedly loaded a LINK key.");
+    }
+
+    private static void TestLinkParamsKeySelection()
+    {
+        var cachedKey = new byte[] { 0x12, 0x34, 0x56 };
+        var withoutExplicitPath = LinkCommands.SelectContextEncryptionKey(null, cachedKey);
+        var withExplicitPath = LinkCommands.SelectContextEncryptionKey("D:\\GameB\\params.dat", cachedKey);
+
+        Assert(ReferenceEquals(cachedKey, withoutExplicitPath), "LINK did not preserve the context key when no explicit params path was supplied.");
+        Assert(withExplicitPath is null, "LINK reused the context key even though an explicit params path was supplied.");
     }
 
     private static void TestRestoreAndReplenish(string testRoot)

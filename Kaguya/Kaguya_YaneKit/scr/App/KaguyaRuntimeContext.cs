@@ -31,10 +31,14 @@ public sealed class KaguyaRuntimeContext
     public static KaguyaRuntimeContext Create(
         string? gameRoot = null,
         string? workDirectory = null,
-        string? paramsPath = null)
+        string? paramsPath = null,
+        bool loadParams = true)
     {
         var toolDirectory = AppContext.BaseDirectory;
-        var resolvedParamsPath = ResolveParamsPath(gameRoot, paramsPath);
+        var resolvedParamsPath = ResolveParamsPath(
+            gameRoot,
+            paramsPath,
+            validateExplicitPath: loadParams);
         var resolvedGameRoot = ResolveGameRoot(gameRoot, resolvedParamsPath);
         var resolvedWorkDirectory = Path.GetFullPath(
             workDirectory ?? Path.Combine(toolDirectory, "workplace"));
@@ -43,7 +47,9 @@ public sealed class KaguyaRuntimeContext
         ParamsDatDocument? document = null;
         byte[]? linkKey = null;
 
-        if (resolvedParamsPath is not null)
+        // params.dat 的格式解析和 LINK key 擷取延後到真正需要內容的命令。
+        // list / verify / raw extract 等命令只需要保留解析後的路徑，不應讀取檔案。
+        if (loadParams && resolvedParamsPath is not null)
         {
             document = new ParamsDatCodec().Read(File.ReadAllBytes(resolvedParamsPath));
             linkKey = Convert.FromBase64String(document.GameSystem.RawBlob.LinkXorKeyBase64);
@@ -85,13 +91,16 @@ public sealed class KaguyaRuntimeContext
     //
     // 不可在明確指定 game root 卻找不到 params.dat 時，
     // 回頭讀取其他遊戲的檔案。
-    private static string? ResolveParamsPath(string? gameRoot, string? paramsPath)
+    private static string? ResolveParamsPath(
+        string? gameRoot,
+        string? paramsPath,
+        bool validateExplicitPath)
     {
         if (!string.IsNullOrWhiteSpace(paramsPath))
         {
             var fullParamsPath = Path.GetFullPath(paramsPath);
 
-            if (!File.Exists(fullParamsPath))
+            if (validateExplicitPath && !File.Exists(fullParamsPath))
             {
                 throw new FileNotFoundException(
                     $"params.dat was specified but does not exist: {fullParamsPath}",

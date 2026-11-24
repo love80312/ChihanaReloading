@@ -24,6 +24,7 @@
 - [params.dat](docs/file/params/README_params_dat.md)
 - [LINK 封包](docs/archive/README_link.md)
 - [AF01 封包](docs/archive/README_af01.md)
+- [測試分級與回歸測試](docs/testing.md)
 - [SCR 腳本](docs/file/params/README_scr.md)
 - [HLS 高階腳本](docs/file/params/README_hls.md)
 - [message.dat](docs/file/params/README_message_dat.md)
@@ -67,6 +68,16 @@ Kaguya_YaneKit.exe [global options] <command> [args]
 Kaguya_YaneKit.exe --game-root "D:\Game" --workdir "D:\Work" archive_unpack "D:\Game\arc\scr.arc" "D:\Work\scr"
 ```
 
+#### GUI 啟動
+
+專案附有 `gui__V5.pyW`，它是命令列 EXE 的 GUI wrapper，格式解析及封包處理由 `Kaguya_YaneKit.exe` 執行，不會另外實作一套格式解析器。需要 Windows、Python 3.10+ 與 Tkinter；在專案目錄可用下列命令啟動：
+
+```powershell
+py -3.10 .\gui__V5.pyW
+```
+
+請確認 GUI 與對應版本的 `Kaguya_YaneKit.exe` 位於預期位置。GUI 操作仍使用相同命令列選項與工作目錄規則。
+
 ### 2.2 統一封包命令
 
 統一入口會依照封包標頭自動判斷 AF01 或 LINK 格式。
@@ -98,6 +109,8 @@ Kaguya_YaneKit.exe archive_pack <input-dir> <manifest.json> <output.arc> [--comp
 - LINK 預設嘗試解密；需要從 `params.dat` 取得 XOR 金鑰。
 - `--no-decrypt` 或 `--raw` 可保留加密資料，不執行解密。
 - `--params <params.dat>` 可指定 LINK 解密所使用的參數檔。
+- LINK 清單、驗證及 raw 解包不需要解析 `params.dat` 的內容；只有實際解密或重新加密時才會讀取金鑰。
+- LINK 明確指定 `--params` 時，該檔案的金鑰優先，不會沿用另一個遊戲預先載入的金鑰。
 
 回封注意事項：
 
@@ -504,13 +517,19 @@ Kaguya_YaneKit.exe --self-test
 | LINK／AF01 路徑委派 | 確認兩種封包的解包路徑均經過 SafePath |
 | 原子寫入失敗保護 | 故意使暫存檔寫入失敗，確認原有檔案不被破壞 |
 | 暫存檔清理 | 確認失敗或完成後不殘留暫存檔 |
+| Runtime Context 延遲解析 | 只保留 params.dat 路徑，不讀取或解析內容 |
+| LINK 金鑰選擇 | 明確指定 `--params` 時，不沿用 context 中的快取金鑰 |
 | Restorer | 測試圖片還原、補充、原子替換及時間戳 |
 
 **測試範圍說明：**
 
-`--self-test` 是核心安全性與檔案操作測試，不是完整的遊戲封包整合測試。
+`--self-test` 是核心安全性、Runtime Context 路徑選擇及檔案操作測試，不是完整的遊戲封包整合測試。LINK 金鑰選擇測試驗證的是參數優先順序，不代表已使用商業遊戲的加密資料完成解密測試。
 
 通過自我測試不代表已經完成所有真實 LINK／AF01 樣本的解包、修改、回封、重新解包及遊戲內載入驗證。實際操作仍應使用備份封包進行閉環比對。
+
+### 5.4 測試分級
+
+專案的測試結果應依 [測試分級與回歸測試](docs/testing.md) 標示 T1～T5。除非有對應的測試輸出或記錄，不應將「已識別版本／格式」寫成「已完整測試」。
 
 ## 6. 樣本測試紀錄
 
@@ -534,12 +553,12 @@ Kaguya_YaneKit.exe --self-test
 
 | # | 遊戲名稱 | 版本與格式 | 狀態 |
 | --- | --- | --- | --- |
-| 01 | `ばくあね ～弟しぼっちゃうぞ！` | `[SCR-PARAMS]v05.4`／`[SCR-Ver5.1]`／`[SCR-MESSAGE]ver4.0`／`LINK6` | 已測 |
+| 01 | `ばくあね ～弟しぼっちゃうぞ！` | `[SCR-PARAMS]v05.4`／`[SCR-Ver5.1]`／`[SCR-MESSAGE]ver4.0`／`LINK6` | 已確認版本／格式；T 等級待補 |
 | 02 | `なまイキ ～生粋荘へようこそ！～` | 待補 | 樣本池 |
-| 03 | `CHU×ペット` | `[SCR-PARAMS]v05.5`／`[SCR-Ver5.1]`／`[SCR-MESSAGE]ver4.0`／`LINK6` | 已測 |
+| 03 | `CHU×ペット` | `[SCR-PARAMS]v05.5`／`[SCR-Ver5.1]`／`[SCR-MESSAGE]ver4.0`／`LINK6` | 已確認版本／格式；T 等級待補 |
 | 04 | `ハラミタマ` | 待補 | 樣本池 |
 | 05 | `えろゼミ ～エッチにヤルきにABC～` | 待補 | 樣本池 |
-| 06 | `ばくあね2 弟いっぱいしぼっちゃうぞ！` | `[SCR-PARAMS]v05.6`／`[SCR-Ver5.1]`／`[SCR-MESSAGE]ver4.0`／`LINK6` | 已測 |
+| 06 | `ばくあね2 弟いっぱいしぼっちゃうぞ！` | `[SCR-PARAMS]v05.6`／`[SCR-Ver5.1]`／`[SCR-MESSAGE]ver4.0`／`LINK6` | 已確認版本／格式；T 等級待補 |
 | 07 | `しごカレ ～エッチな女子大生とドキ×2ラブレッスン!!` | 待補 | 樣本池 |
 | 08 | `Love×Holic ～魅惑の乙女と白濁カンケイ～` | 待補 | 樣本池 |
 | 09 | `姉ちゃんのススメ ～お姉ちゃんのイタズラ性生活～` | 待補 | 樣本池 |
@@ -547,10 +566,10 @@ Kaguya_YaneKit.exe --self-test
 | 11 | `Mama×Holic ～魅惑のママと甘々カンケイ～` | 待補 | 樣本池 |
 | 12 | `ねぇねぇ姉` | 待補 | 樣本池 |
 | 13 | `アネトモ` | 待補 | 樣本池 |
-| 14 | `Bunny’s ママ代行サービス` | `[SCR-PARAMS]v05.7`／`[SCR-Ver5.3]`／`[SCR-MESSAGE]ver4.0`／`LINK6` | 已測 |
+| 14 | `Bunny’s ママ代行サービス` | `[SCR-PARAMS]v05.7`／`[SCR-Ver5.3]`／`[SCR-MESSAGE]ver4.0`／`LINK6` | 已確認版本／格式；T 等級待補 |
 | 15 | `Pure×Holic～純潔乙女と婚姻カンケイ！？～` | 待補 | 樣本池 |
 | 16 | `おっぱいでかいナースとイチャコラエロ×２入院生活！？` | 待補 | 樣本池 |
-| 17 | `Hakoniwaハコニワ` | `[SCR-PARAMS]v05.8`／`[SCR-Ver5.3]`／`[SCR-MESSAGE]ver4.0`／`LINK6` | 已測 |
+| 17 | `Hakoniwaハコニワ` | `[SCR-PARAMS]v05.8`／`[SCR-Ver5.3]`／`[SCR-MESSAGE]ver4.0`／`LINK6` | 已確認版本／格式；T 等級待補 |
 | 18 | `ママトモ` | 未發布 | 待補 |
 
 ## 7. 支援範圍與注意事項
@@ -562,4 +581,3 @@ Kaguya_YaneKit.exe --self-test
 - ANM／PLT 等圖片動畫格式，編輯後回封可能重新產生內部壓縮資料，不保證與原始 payload 字節完全相同。
 - 修改任何遊戲資源前，請先備份原始檔案。
 - 建議保留原始封包、解包資料、修改資料及回封結果，以便進行 SHA256 或內容比對。
-

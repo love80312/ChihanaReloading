@@ -46,11 +46,14 @@ public static class ArchiveCommands
                 var manifest = codec.ReadManifest(stream);
                 PrintLinkInfo(manifest);
                 var stopwatch = Stopwatch.StartNew();
+                var contextKey = LinkCommands.SelectContextEncryptionKey(
+                    paramsPath,
+                    context?.LinkEncryptionKey);
                 codec.Extract(
                     archivePath,
                     outputDirectory,
                     paramsPath ?? context?.ParamsPath,
-                    context?.LinkEncryptionKey,
+                    contextKey,
                     decrypt,
                     overwriteExisting: overwriteExisting);
                 Console.WriteLine($"Extracted {manifest.Entries.Count} LINK entries to {outputDirectory} in {stopwatch.Elapsed.TotalSeconds:F2}s");
@@ -380,7 +383,13 @@ public static class ArchiveCommands
         }
 
         var document = new ParamsDatCodec().Read(File.ReadAllBytes(fullPath));
-        return Convert.FromBase64String(document.GameSystem.RawBlob.LinkXorKeyBase64);
+        var key = Convert.FromBase64String(document.GameSystem.RawBlob.LinkXorKeyBase64);
+        if (key.Length == 0)
+        {
+            throw new InvalidDataException("params.dat contains an empty LINK encryption key.");
+        }
+
+        return key;
     }
 
     private static void PrintAf01Info(Af01ArchiveManifest manifest)

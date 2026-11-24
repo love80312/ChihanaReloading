@@ -107,8 +107,10 @@ link repack6 <input-dir> <_link_manifest.json> <output.arc> [--compress|--no-com
 
 `archive_unpack` / `link extract` 读取 manifest 后，会打开一次共享只读句柄，并用 `RandomAccess.Read` 按 entry 的 `DataOffset/DataSize` 直接随机读数据。这样 600 个以上 entry 的封包不会再为每个 entry 反复 `File.OpenRead(archivePath)`。
 
-输出文件仍按 entry 级并行写出，当前并行度为 256：
+输出文件仍按 entry 级并行写出：
 
+- 解包并行度默认是 `CPU 核心数 × 2`，限制在 1～32。
+- 可用环境变量 `KAGUYA_ARCHIVE_PARALLELISM` 覆盖；可解析的整数值会限制在 1～64。未设置或无法解析时使用默认值。
 - BMR 压缩 entry：按 entry payload 读入内存，识别 `BMR` 后解压。
 - 普通 entry：从共享句柄按 offset 分块复制到输出文件。
 - 加密 entry：从共享句柄按 offset 分块读取，按图像头部长度跳过明文头后 XOR 解密。
@@ -121,6 +123,12 @@ link repack6 <input-dir> <_link_manifest.json> <output.arc> [--compress|--no-com
 2. 原 entry 带压缩标志，且选择 `--no-compress`：写入明文文件，并清除压缩 flag。
 3. 原 entry 带加密标志，且选择 `--encrypt`：用 params key 重新 XOR 加密，并保留加密 flag。
 4. 原 entry 带加密标志，且选择 `--no-encrypt`：写入明文文件，并清除加密 flag。
+
+LINK pack 的压缩并行度由 `KAGUYA_LINK_PACK_PARALLELISM` 控制：
+
+- 默认值为 `max(1, CPU 核心数 / 2)`，默认范围限制在 1～32。
+- 若环境变量可解析为整数，则将其限制在 1～64。
+- `KAGUYA_ARCHIVE_PARALLELISM` 只控制解包；`KAGUYA_LINK_PACK_PARALLELISM` 只控制 LINK6 回封压缩。
 
 交互式 `Archive Pack` 会分别询问是否重新压缩、是否重新加密。
 

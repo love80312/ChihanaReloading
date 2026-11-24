@@ -96,7 +96,8 @@ archive_pack <input-dir> <manifest.json> <output.arc> [--compress|--no-compress]
 解包：
 
 - 显示 magic、version、index offset。
-- entry 级并行解包，默认并行度为 256。
+- entry 级并行解包，默认并行度为 `CPU 核心數 × 2`，並限制在 1～32。
+- 可用環境變數 `KAGUYA_ARCHIVE_PARALLELISM` 覆寫；可解析的整數值會限制在 1～64。未設定或無法解析時使用預設值。
 
 打包：
 
@@ -110,8 +111,9 @@ archive_pack <input-dir> <manifest.json> <output.arc> [--compress|--no-compress]
 AF01 pack 现在采用 entry 级并行预压缩：
 
 1. 先扫描 manifest，准备所有 entry 的文件名、flags、大小信息。
-2. 对需要压缩的 entry 使用 `Parallel.ForEach` 并行执行 `LzPack`，当前并行度为 256。
-3. 所有压缩任务完成后，再按 manifest 原顺序串行写出数据区和 index。
+2. 对需要压缩的 entry 使用 `Parallel.ForEach` 并行执行 `LzPack`。
+3. 默认并行度为 `CPU 核心數 × 2`，限制在 1～32；可用 `KAGUYA_ARCHIVE_PARALLELISM` 覆寫為 1～64。
+4. 所有压缩任务完成后，再按 manifest 原顺序串行写出数据区和 index。
 
 这样可以加速 `CGW.ARC` / `PARTS.ARC` 这类 packed entry 较多的包，同时不破坏 entry 顺序和 index offset。
 

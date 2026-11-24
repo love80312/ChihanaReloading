@@ -35,15 +35,18 @@ public static class KaguyaApp
         KaguyaRuntimeContext? context = null;
 
         // msg / tblstr / tbl / params / pe / help / self-test 不依賴遊戲執行環境。
-        // 避免它們因目前工作目錄中存在不相容的 params.dat 而被無關錯誤阻擋。
+        // LINK／AF01 命令只需要遊戲路徑資訊；不要在啟動時預先解析 params.dat，
+        // 否則清單、驗證、raw 解包等不需要金鑰的操作也會被無關的 params.dat 錯誤阻擋。
         if (!IsHelp(args) && RequiresRuntimeContext(command))
         {
             try
             {
+                var loadParams = command is "scr" or "pic" or "character";
                 context = KaguyaRuntimeContext.Create(
                     startup.GameRoot,
                     startup.WorkDirectory,
-                    startup.ParamsPath);
+                    startup.ParamsPath,
+                    loadParams);
             }
             catch (Exception ex)
             {

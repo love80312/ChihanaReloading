@@ -82,7 +82,8 @@ public static class LinkCommands
         var decrypt = !HasFlag(args, "--no-decrypt") && !HasFlag(args, "--raw");
         var codec = new LinkArchiveCodec();
         var stopwatch = Stopwatch.StartNew();
-        codec.Extract(args[1], args[2], paramsPath ?? context?.ParamsPath, context?.LinkEncryptionKey, decrypt);
+        var contextKey = SelectContextEncryptionKey(paramsPath, context?.LinkEncryptionKey);
+        codec.Extract(args[1], args[2], paramsPath ?? context?.ParamsPath, contextKey, decrypt);
         using var stream = File.OpenRead(args[1]);
         var manifest = codec.ReadManifest(stream);
         Console.WriteLine($"Extracted {manifest.Entries.Count} entries to {args[2]} in {stopwatch.Elapsed.TotalSeconds:F2}s");
@@ -97,6 +98,11 @@ public static class LinkCommands
         Console.WriteLine($"Wrote {Path.Combine(args[2], "_link_manifest.json")}");
         return 0;
     }
+
+    // 明確指定 --params 時，必須讓 codec 從該路徑讀取金鑰，不能沿用其他遊戲的 context key。
+    // 未指定 --params 時才允許使用 context 中預先載入的金鑰。
+    internal static byte[]? SelectContextEncryptionKey(string? explicitParamsPath, byte[]? contextKey) =>
+        string.IsNullOrWhiteSpace(explicitParamsPath) ? contextKey : null;
 
     private static int Pack6(string[] args)
     {
@@ -347,6 +353,12 @@ public static class LinkCommands
         }
 
         var document = new ParamsDatCodec().Read(File.ReadAllBytes(fullPath));
-        return Convert.FromBase64String(document.GameSystem.RawBlob.LinkXorKeyBase64);
+        var key = Convert.FromBase64String(document.GameSystem.RawBlob.LinkXorKeyBase64);
+        if (key.Length == 0)
+        {
+            throw new InvalidDataException("params.dat contains an empty LINK encryption key.");
+        }
+
+        return key;
     }
 }
