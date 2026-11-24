@@ -7,7 +7,7 @@ on:
       - main
     paths:
       - "Kaguya/Kaguya_YaneKit/**"
-      - ".github/workflows/exe.yml"
+      - ".github/workflows/Kaguya_YaneKit.yml"
 
   workflow_dispatch:
 
@@ -25,9 +25,14 @@ jobs:
       PUBLISH_DIR: artifacts/Kaguya_YaneKit
 
     steps:
-      # 1. 取得原始碼
+      # 1. 只 Checkout Kaguya_YaneKit，避免展開整個 Repository
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            /Kaguya/Kaguya_YaneKit/
+          sparse-checkout-cone-mode: false
+          submodules: false
 
       # 2. 安裝 .NET 8 SDK
       - name: Setup .NET
