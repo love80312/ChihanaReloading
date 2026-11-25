@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 """Kaguya_YaneKit GUI wrapper.
 
@@ -7,6 +8,7 @@
 """
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 import os
@@ -31,6 +33,7 @@ ENCODINGS = [
     ("Windows-1252", "windows-1252"),
 ]
 MAX_LOG_LINES = 8000
+STDOUT_READ_SIZE = 64 * 1024
 
 
 def field(key: str, label: str, kind: str = "text", required: bool = True,
@@ -194,10 +197,10 @@ OPS += [
         field("params_json", "params.json（可留空）", "file", False, extensions=FILE_JSON)], ["src"],
        options=[("read_encoding", "--read-encoding"), ("write_encoding", "--write-encoding"), ("params_json", "--params-json")]),
     op("腳本", "SCR 低階反組譯", ["scr", "disasm"], "以低階 SCRASM 格式反組譯 .scr，供指令層級檢視。",
-       [field("src", "輸入 SCR", "file", extensions=FILE_SCR), field("dst", "輸出反組譯 TXT", "save_file", extensions=FILE_TXT), enc_read_scr], ["src", "dst"],
+       [field("src", "輸入 SCR", "file", extensions=FILE_SCR), field("dst", "輸出反組譯 TXT", "save_file", extensions=FILE_TXT), enc_read_scr], ["src"],
        options=[("read_encoding", "--read-encoding")]),
     op("腳本", "SCRASM TXT → SCR", ["scr", "asm"], "將低階 SCRASM 文字重新組譯為 .scr。",
-       [field("src", "輸入 SCRASM TXT", "file", extensions=FILE_TXT), field("dst", "輸出 SCR", "save_file", extensions=FILE_SCR), enc_write_scr], ["src", "dst"],
+       [field("src", "輸入 SCRASM TXT", "file", extensions=FILE_TXT), field("dst", "輸出 SCR", "save_file", extensions=FILE_SCR), enc_write_scr], ["src"],
        options=[("write_encoding", "--write-encoding")]),
     op("腳本", "匯出 SCR Opcode Schema", ["scr", "opcodes"], "匯出集中管理的 SCR opcode 規格；輸出檔可留空，將使用工具預設行為。",
        [field("dst", "輸出 Markdown（可留空）", "save_file", False, extensions=[("Markdown", "*.md"), ("所有檔案", "*.*")])], ["dst"]),
@@ -427,7 +430,7 @@ class KaguyaGui:
         self.root.minsize(min_width, min_height)
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.worker: threading.Thread | None = None
-        self.process: subprocess.Popen[str] | None = None
+        self.process: subprocess.Popen[bytes] | None = None
         self._process_lock = threading.Lock()
         self._closing = False
         self.current_operation: dict[str, Any] | None = None
@@ -1052,7 +1055,7 @@ class KaguyaGui:
             self._refresh_command_preview()
 
     def _field_value(self, key: str) -> Any:
-        # v05+ 編碼欄位僅顯示固定 UTF-16LE，不傳入 CLI。
+        # v05+ 的編碼欄位固定 UTF-16LE，略過必填欄位檢查。
         if key in self._params_encoding_fixed_keys:
             return ""
         variable = self.field_vars[key]
@@ -1460,6 +1463,7 @@ class KaguyaGui:
                 self._log(f"執行步驟 {index}/{len(commands)}：" + subprocess.list2cmdline(command), "info")
             else:
                 self._log("執行：" + subprocess.list2cmdline(command), "info")
+
         def command_option(command: list[str], option: str) -> str | None:
             try:
                 index = command.index(option)
@@ -1486,6 +1490,7 @@ class KaguyaGui:
                 "params.dat：未手動指定；目前 _ai_fix 會依序搜尋 CLI 工作目錄與 EXE 目錄。",
                 "info",
             )
+
         self.worker = threading.Thread(target=self._execute, args=(commands, cwd), daemon=True)
         self.worker.start()
 
@@ -1493,7 +1498,7 @@ class KaguyaGui:
         started = time.time()
         try:
             for index, command in enumerate(commands, start=1):
-                process: subprocess.Popen[str] | None = None
+                process: subprocess.Popen[bytes] | None = None
                 with self._process_lock:
                     if self._closing:
                         return
@@ -1501,26 +1506,75 @@ class KaguyaGui:
                     process = subprocess.Popen(
                         command, cwd=cwd, stdin=subprocess.DEVNULL,
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, encoding="utf-8", errors="replace", bufsize=1,
+                        text=False, bufsize=0,
                         creationflags=creationflags,
                     )
                     self.process = process
+
                 self.events.put(("started", (process.pid, index, len(commands))))
                 assert process.stdout is not None
-                for line in process.stdout:
-                    self.events.put(("line", line.rstrip("\r\n")))
+
+                # 使用二進位管線分塊讀取；UTF-8 增量解碼可處理跨區塊的多位元組字元。
+                decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                pending_cr = False
+                last_output_char = ""
+
+                def normalize_newlines(text: str, final: bool = False) -> str:
+                    nonlocal pending_cr
+
+                    # 前一個區塊尾端若是 CR，需與本區塊開頭的 LF 合併。
+                    if pending_cr:
+                        if text.startswith("\n"):
+                            text = text[1:]
+                        text = "\n" + text
+                        pending_cr = False
+
+                    # 區塊最後一個 CR 先保留，等待下一個區塊判斷是否為 CRLF。
+                    if not final and text.endswith("\r"):
+                        text = text[:-1]
+                        pending_cr = True
+
+                    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+                while True:
+                    chunk = os.read(process.stdout.fileno(), STDOUT_READ_SIZE)
+                    if not chunk:
+                        break
+
+                    decoded = decoder.decode(chunk, final=False)
+                    normalized = normalize_newlines(decoded)
+                    if normalized:
+                        last_output_char = normalized[-1]
+                        self.events.put(("output", normalized))
+
+                tail = decoder.decode(b"", final=True)
+                normalized_tail = normalize_newlines(tail, final=True)
+                if normalized_tail:
+                    last_output_char = normalized_tail[-1]
+                    self.events.put(("output", normalized_tail))
+
+                # 舊版逐行讀取會為未以換行結尾的最後一行補上換行。
+                if last_output_char and last_output_char != "\n":
+                    self.events.put(("output", "\n"))
+
+                process.stdout.close()
                 code = process.wait()
+
                 with self._process_lock:
                     if self.process is process:
                         self.process = None
+
                 if code != 0:
                     elapsed = time.time() - started
                     self.events.put(("done", (code, elapsed, index, len(commands))))
                     return
+
             elapsed = time.time() - started
             self.events.put(("done", (0, elapsed, len(commands), len(commands))))
+
         except Exception as exc:
             self.events.put(("failed", str(exc)))
+
         finally:
             with self._process_lock:
                 self.process = None
@@ -1536,8 +1590,10 @@ class KaguyaGui:
                         self.status_var.set(f"執行步驟 {step_index}/{step_total}（PID {pid}）")
                     else:
                         self.status_var.set(f"執行中（PID {pid}）")
-                elif kind == "line":
-                    self._log(str(payload))
+
+                elif kind == "output":
+                    self._log_batch(str(payload))
+
                 elif kind == "done":
                     code, elapsed, completed_steps, total_steps = payload
                     self.progress.stop()
@@ -1550,14 +1606,17 @@ class KaguyaGui:
                     else:
                         self.status_var.set(f"步驟 {completed_steps}/{total_steps} 失敗，Exit code = {code}")
                         self._log(f"執行失敗：步驟 {completed_steps}/{total_steps}，Exit code = {code}。後續步驟已停止。", "error")
+
                 elif kind == "failed":
                     self.progress.stop()
                     self.run_button.configure(state="normal")
                     self.stop_button.configure(state="disabled")
                     self.status_var.set("執行錯誤")
                     self._log("執行錯誤：" + str(payload), "error")
+
         except queue.Empty:
             pass
+
         self.root.after(100, self._poll_events)
 
     def _stop_process(self) -> None:
@@ -1602,13 +1661,24 @@ class KaguyaGui:
 
     def _log(self, text: str, tag: str | None = None) -> None:
         self.log.insert("end", text + "\n", tag or ())
+        self._trim_log()
+        self.log.see("end")
+
+    def _log_batch(self, text: str) -> None:
+        """一次插入一批 CLI stdout，避免逐行操作 Tk Text 控制項。"""
+        if not text:
+            return
+        self.log.insert("end", text)
+        self._trim_log()
+        self.log.see("end")
+
+    def _trim_log(self) -> None:
         try:
             end_line = int(self.log.index("end-1c").split(".", 1)[0])
             if end_line > MAX_LOG_LINES:
                 self.log.delete("1.0", f"{end_line - MAX_LOG_LINES}.0")
         except (tk.TclError, ValueError):
             pass
-        self.log.see("end")
 
     def _on_close(self) -> None:
         # 先封鎖新的子程序啟動，再讀取目前程序，避免關閉視窗時漏掉剛啟動的 EXE。
