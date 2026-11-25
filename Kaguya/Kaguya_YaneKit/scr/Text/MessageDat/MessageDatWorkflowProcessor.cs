@@ -1,3 +1,4 @@
+
 // ============================================================================
 // MessageDatWorkflowProcessor.cs
 // 导出/导入工作流变换处理器
@@ -10,7 +11,7 @@
 // 核心算法:
 //   AdjustBranchMessages - 交换分支命令中 Params[0] 与 Params[AdjustMsgId] 的消息文本
 //   FixMessageLengths    - 按 MsgLengthSet 自动换行, 对话文本行尾补全角空格
-//   CheckMessageLengths  - 检查行数(<=3)和行宽, 输出警告
+//   CheckMessageLengths  - 分别统计 LENGTH 与 STRUCTURE 警告
 //   CheckEncoding        - 逐 Rune 检查目标编码兼容性, 输出定位明细
 //   DisplayLength        - 计算显示宽度, 占位符使用 PlaceholderDisplayLengths 配置值
 //
@@ -119,7 +120,8 @@ public sealed class MessageDatWorkflowProcessor
                 continue;
             }
 
-            if (CountIssues(message.Text, silent: true) == 0)
+            var issues = CountIssues(message.Text, silent: true);
+            if (issues.Length + issues.Structure == 0)
             {
                 continue;
             }
@@ -133,13 +135,20 @@ public sealed class MessageDatWorkflowProcessor
 
     private void CheckMessageLengths(MessageDatDocument document)
     {
-        var warnings = 0;
+        var lengthWarnings = 0;
+        var structureWarnings = 0;
+
         for (var i = 0; i < document.Messages.Count; i++)
         {
-            warnings += CountIssues(document.Messages[i].Text, silent: false, $"C{i:X8}");
+            var issues = CountIssues(document.Messages[i].Text, silent: false, $"C{i:X8}");
+            lengthWarnings += issues.Length;
+            structureWarnings += issues.Structure;
         }
 
-        Console.WriteLine($"MsgLengthCheck: {warnings} warning(s).");
+        var totalWarnings = lengthWarnings + structureWarnings;
+        Console.WriteLine(
+            $"MsgLengthCheck: LENGTH {lengthWarnings} warning(s), " +
+            $"STRUCTURE {structureWarnings} warning(s), TOTAL {totalWarnings} warning(s).");
     }
 
     private void CheckEncoding(MessageDatDocument document, Encoding encoding)
@@ -163,12 +172,14 @@ public sealed class MessageDatWorkflowProcessor
         Console.WriteLine($"GBKCheck: {invalid} incompatible character(s).");
     }
 
-    private int CountIssues(string text, bool silent, string id = "")
+    private (int Length, int Structure) CountIssues(string text, bool silent, string id = "")
     {
-        var warnings = 0;
+        var lengthWarnings = 0;
+        var structureWarnings = 0;
+
         if (!string.IsNullOrWhiteSpace(text) && !text.EndsWith('\n'))
         {
-            warnings++;
+            structureWarnings++;
             if (!silent) Console.WriteLine($"[STRUCTURE] {id} does not end with \\n.");
         }
 
@@ -181,7 +192,7 @@ public sealed class MessageDatWorkflowProcessor
 
         if (contentLines > 3)
         {
-            warnings++;
+            structureWarnings++;
             if (!silent) Console.WriteLine($"[STRUCTURE] {id} has {contentLines} lines.");
         }
 
@@ -190,12 +201,12 @@ public sealed class MessageDatWorkflowProcessor
             var length = DisplayLength(lines[i]);
             if (length > _config.MsgLengthSet)
             {
-                warnings++;
+                lengthWarnings++;
                 if (!silent) Console.WriteLine($"[LENGTH] {id} line {i + 1}: {length}>{_config.MsgLengthSet}");
             }
         }
 
-        return warnings;
+        return (lengthWarnings, structureWarnings);
     }
 
     private string Wrap(string text, bool padFullWidthSpaceBeforeNewline)
