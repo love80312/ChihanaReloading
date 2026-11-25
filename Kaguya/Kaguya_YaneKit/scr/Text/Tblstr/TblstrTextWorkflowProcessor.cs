@@ -1,3 +1,4 @@
+
 using System.Text;
 using System.Text.RegularExpressions;
 using Kaguya_YaneKit.Text.MessageDat;
@@ -22,8 +23,10 @@ public sealed class TblstrTextWorkflowProcessor
         var lines = new List<string>();
         var fixedCount = 0;
         var lengthWarnings = 0;
+        var structureWarnings = 0;
         var invalidChars = 0;
         var pendingSpeakerName = false;
+
         foreach (var line in ReadLogicalLines(text))
         {
             var match = TranslationLineRegex.Match(line);
@@ -36,18 +39,26 @@ public sealed class TblstrTextWorkflowProcessor
             var id = $"T{match.Groups[1].Value.ToUpperInvariant()}";
             var tag = match.Groups[2].Value;
             var content = Unescape(match.Groups[3].Value);
+
             if (tag == "msg")
             {
                 var isDialogue = pendingSpeakerName && IsDialogueText(content);
-                if (_config.MsgLengthFix && CountLengthIssues(content, silent: true) > 0)
+
+                if (_config.MsgLengthFix)
                 {
-                    content = Wrap(content, isDialogue);
-                    fixedCount++;
+                    var fixIssues = CountLengthIssues(content, silent: true);
+                    if (fixIssues.Length + fixIssues.Structure > 0)
+                    {
+                        content = Wrap(content, isDialogue);
+                        fixedCount++;
+                    }
                 }
 
                 if (_config.MsgLengthCheck)
                 {
-                    lengthWarnings += CountLengthIssues(content, silent: false, id);
+                    var issues = CountLengthIssues(content, silent: false, id);
+                    lengthWarnings += issues.Length;
+                    structureWarnings += issues.Structure;
                 }
 
                 pendingSpeakerName = false;
@@ -76,7 +87,10 @@ public sealed class TblstrTextWorkflowProcessor
 
         if (_config.MsgLengthCheck)
         {
-            Console.WriteLine($"TBLSTR MsgLengthCheck: {lengthWarnings} warning(s).");
+            var totalWarnings = lengthWarnings + structureWarnings;
+            Console.WriteLine(
+                $"TBLSTR MsgLengthCheck: LENGTH {lengthWarnings} warning(s), " +
+                $"STRUCTURE {structureWarnings} warning(s), TOTAL {totalWarnings} warning(s).");
         }
 
         if (_config.GbkCheck && writeEncoding.CodePage is 936 or 54936)
@@ -87,12 +101,14 @@ public sealed class TblstrTextWorkflowProcessor
         return string.Join(Environment.NewLine, lines) + Environment.NewLine;
     }
 
-    private int CountLengthIssues(string text, bool silent, string id = "")
+    private (int Length, int Structure) CountLengthIssues(string text, bool silent, string id = "")
     {
-        var warnings = 0;
+        var lengthWarnings = 0;
+        var structureWarnings = 0;
+
         if (!string.IsNullOrWhiteSpace(text) && !text.EndsWith('\n'))
         {
-            warnings++;
+            structureWarnings++;
             if (!silent) Console.WriteLine($"[TBLSTR STRUCTURE] {id} does not end with \\n.");
         }
 
@@ -105,7 +121,7 @@ public sealed class TblstrTextWorkflowProcessor
 
         if (contentLines > 3)
         {
-            warnings++;
+            structureWarnings++;
             if (!silent) Console.WriteLine($"[TBLSTR STRUCTURE] {id} has {contentLines} lines.");
         }
 
@@ -114,12 +130,12 @@ public sealed class TblstrTextWorkflowProcessor
             var length = DisplayLength(lines[i]);
             if (length > _config.MsgLengthSet)
             {
-                warnings++;
+                lengthWarnings++;
                 if (!silent) Console.WriteLine($"[TBLSTR LENGTH] {id} line {i + 1}: {length}>{_config.MsgLengthSet}");
             }
         }
 
-        return warnings;
+        return (lengthWarnings, structureWarnings);
     }
 
     private string Wrap(string text, bool padFullWidthSpaceBeforeNewline)
@@ -136,6 +152,7 @@ public sealed class TblstrTextWorkflowProcessor
         var lineLimit = padFullWidthSpaceBeforeNewline
             ? Math.Max(1, _config.MsgLengthSet - 1)
             : _config.MsgLengthSet;
+
         foreach (var segment in EnumerateDisplaySegments(continuous))
         {
             if (current.Length > 0 && currentLength + segment.DisplayLength > lineLimit)
@@ -225,11 +242,13 @@ public sealed class TblstrTextWorkflowProcessor
         var count = 0;
         var line = 1;
         var column = 1;
+
         for (var i = 0; i < text.Length;)
         {
             var length = char.IsSurrogatePair(text, i) ? 2 : 1;
             var value = length == 2 ? char.ConvertToUtf32(text, i) : text[i];
             var token = text.Substring(i, length);
+
             try
             {
                 clone.GetByteCount(token);
