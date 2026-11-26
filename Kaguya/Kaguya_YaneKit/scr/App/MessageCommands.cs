@@ -367,7 +367,7 @@ public static class MessageCommands
         return equal ? 0 : 2;
     }
 
-    // 构建命令上下文: 解析 INI 配置 -> 确定编码 -> 创建 codec
+    // 建立命令上下文: 解析 INI 配置 -> 确定编码 -> 创建 codec
     private static MessageCommandContext CreateContext(string[] args)
     {
         var iniOption = GetOption(args, "--ini");
@@ -377,8 +377,11 @@ public static class MessageCommands
         }
 
         var placeholders = MessagePlaceholderConfig.Load(iniOption ?? FindDefaultIni());
-        var readEncodingName = placeholders.ReadEncodingName ?? GetOption(args, "--read-encoding");
-        var writeEncodingName = placeholders.WriteEncodingName ?? GetOption(args, "--write-encoding") ?? readEncodingName;
+
+        // 命令列明確指定的編碼優先於 INI Profile。
+        // 未指定時才沿用 INI，最後由 codec 使用其內建預設值。
+        var (readEncodingName, writeEncodingName) = ResolveEncodingNames(placeholders, args);
+
         var readEncoding = MessageDatCodec.ResolveEncoding(readEncodingName);
         var writeEncoding = MessageDatCodec.ResolveEncoding(writeEncodingName);
         return new MessageCommandContext(
@@ -386,6 +389,21 @@ public static class MessageCommands
             placeholders,
             readEncoding,
             writeEncoding);
+    }
+
+    // 供 CLI 正常執行與 --self-test 共用，避免測試只驗證另一套獨立邏輯。
+    // 優先順序：CLI 明確參數 > INI Profile > 讀取編碼回退。
+    internal static (string? ReadEncodingName, string? WriteEncodingName) ResolveEncodingNames(
+        MessagePlaceholderConfig placeholders,
+        string[] args)
+    {
+        var readEncodingName =
+            GetOption(args, "--read-encoding") ?? placeholders.ReadEncodingName;
+
+        var writeEncodingName =
+            GetOption(args, "--write-encoding") ?? placeholders.WriteEncodingName ?? readEncodingName;
+
+        return (readEncodingName, writeEncodingName);
     }
 
     private static MessageVer3DatCodec CreateVer3Codec(MessageCommandContext context) =>
