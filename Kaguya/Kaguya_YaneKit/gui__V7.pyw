@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """Kaguya_YaneKit GUI wrapper.
 
@@ -9,13 +8,11 @@
 from __future__ import annotations
 
 import codecs
-import hashlib
 import json
 import os
 import queue
 import re
 import subprocess
-import tempfile
 import threading
 import time
 import tkinter as tk
@@ -600,6 +597,7 @@ class KaguyaGui:
             buttons, text="強制停止", command=self._stop_process, state="disabled")
         self.stop_button.pack(side="left", padx=6)
         ttk.Button(buttons, text="複製命令", command=self._copy_command).pack(side="left")
+
         self.progress = ttk.Progressbar(buttons, mode="indeterminate", length=130)
         self.progress.pack(side="right", padx=(8, 0))
         ttk.Label(buttons, textvariable=self.status_var).pack(side="right", padx=5)
@@ -1154,98 +1152,6 @@ class KaguyaGui:
 
         return input_paths, output_paths
 
-    def _make_encoding_override_ini(
-        self,
-        source: Path,
-        read_encoding: str,
-        write_encoding: str,
-        override_read: bool,
-        override_write: bool,
-    ) -> str:
-        """建立 GUI 專用 INI，將明確選取的編碼寫入作用中的 Profile。"""
-        source = source.expanduser().resolve(strict=True)
-        original_bytes = source.read_bytes()
-        original = original_bytes.decode("utf-8-sig").splitlines()
-
-        active_id = "0"
-        for line in original:
-            match = re.match(r"\s*ConfigurationID\s*=\s*(.*?)\s*$", line, re.IGNORECASE)
-            if match:
-                active_id = match.group(1).strip() or "0"
-                break
-
-        active_prefix = f"■[{active_id}]["
-        if not any(line.strip().startswith(active_prefix) for line in original):
-            active_id = "0"
-            active_prefix = "■[0]["
-
-        overrides: dict[str, str] = {}
-        if override_read:
-            overrides["readingencoding"] = f"ReadingEncoding = {read_encoding}"
-        if override_write:
-            overrides["writingencoding"] = f"WritingEncoding = {write_encoding}"
-
-        # 只修改作用中 Profile；其他 Profile、全域設定及占位符資料都保留。
-        output: list[str] = []
-        emitted: set[str] = set()
-        in_active = False
-        active_found = False
-
-        def append_missing_overrides() -> None:
-            for key, line in overrides.items():
-                if key not in emitted:
-                    output.append(line)
-                    emitted.add(key)
-
-        for line in original:
-            stripped = line.strip()
-            if stripped.startswith("■["):
-                if in_active:
-                    append_missing_overrides()
-                in_active = stripped.startswith(active_prefix)
-                active_found = active_found or in_active
-                output.append(line)
-                continue
-
-            if in_active and "=" in stripped and not stripped.startswith(";"):
-                key = stripped.split("=", 1)[0].strip().lower()
-                if key in overrides:
-                    if key not in emitted:
-                        output.append(overrides[key])
-                        emitted.add(key)
-                    # 重複的同名設定一併移除，避免後續值覆蓋 GUI 選取值。
-                    continue
-
-            output.append(line)
-
-        if in_active:
-            append_missing_overrides()
-
-        # 原始 INI 沒有可用的 [0] Profile 時，建立一個最小 Profile，供 CLI 正常讀取覆寫值。
-        if not active_found:
-            if output and output[-1].strip():
-                output.append("")
-            output.append("■[0][GUI encoding overrides]")
-            append_missing_overrides()
-
-        signature = b"\0".join((
-            str(source).encode("utf-8"),
-            hashlib.sha256(original_bytes).hexdigest().encode("ascii"),
-            read_encoding.encode("utf-8"),
-            write_encoding.encode("utf-8"),
-            str(override_read).encode("ascii"),
-            str(override_write).encode("ascii"),
-        ))
-        filename = hashlib.sha256(signature).hexdigest() + ".ini"
-        base = Path(os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or tempfile.gettempdir())
-        folder = base / "Kaguya_YaneKit_GUI" / "encoding_overrides"
-        folder.mkdir(parents=True, exist_ok=True)
-        destination = folder / filename
-        generated_text = "\n".join(output) + "\n"
-        if not destination.is_file() or destination.read_text(encoding="utf-8") != generated_text:
-            destination.write_text(generated_text, encoding="utf-8")
-        return str(destination.resolve())
-
     def _build_commands(self) -> list[list[str]]:
         """建立命令清單。Sort + Convert 會依序執行兩個原始 CLI 子命令。"""
         operation = self.current_operation
@@ -1292,6 +1198,7 @@ class KaguyaGui:
             global_args += ["--game-root", str(game_root_path), "--workdir", str(workdir_path)]
         else:
             if game_root:
+
                 game_root_path = self._absolute_path(game_root)
                 if not game_root_path.is_dir():
                     raise NotADirectoryError(f"遊戲根目錄不存在：{game_root_path}")
@@ -1326,28 +1233,6 @@ class KaguyaGui:
                 input_paths.append(auto_params.resolve())
 
         self._check_output_collisions(input_paths, output_paths)
-
-        # msg CLI 會優先採用 INI 內作用中 Profile 的編碼。
-        # 使用持久化的覆寫 INI，讓 GUI 實際執行與複製命令完全一致；原始 INI 不會被修改。
-        if operation["command"] and operation["command"][0] == "msg" and "ini" in values:
-            if values.get("ini"):
-                ini_path = self._absolute_path(str(values["ini"]))
-            else:
-                candidate = exe.parent / "ini" / "message_config.ini"
-                ini_path = candidate if candidate.is_file() else None
-
-            if ini_path is not None:
-                if not ini_path.is_file():
-                    raise FileNotFoundError(f"message_config.ini 不存在：{ini_path}")
-                read_encoding = str(values.get("read_encoding") or "cp932")
-                write_encoding = str(values.get("write_encoding") or read_encoding)
-                values["ini"] = self._make_encoding_override_ini(
-                    ini_path,
-                    read_encoding,
-                    write_encoding,
-                    override_read="read_encoding" in values,
-                    override_write="write_encoding" in values,
-                )
 
         steps = operation.get("steps") or [{
             "command": operation["command"],
@@ -1637,7 +1522,7 @@ class KaguyaGui:
             command_text = " && ".join(subprocess.list2cmdline(command) for command in commands)
             self.root.clipboard_clear()
             self.root.clipboard_append(command_text)
-            self.status_var.set("命令已複製（編碼覆寫設定檔會保留在本機使用者資料夾）")
+            self.status_var.set("命令已複製")
         except Exception as exc:
             messagebox.showerror("無法複製命令", str(exc))
 
