@@ -128,20 +128,48 @@ OPS += [
 # ---------------------------------------------------------------------------
 ini_field = field("ini", "message_config.ini（可留空，使用 EXE 預設）", "file", False,
                   extensions=[("INI 設定", "*.ini"), ("所有檔案", "*.*")])
-read_enc = field("read_encoding", "讀取 原message.dat 之編碼", "choice", True, "gbk",
-                 [(label, value) for label, value in ENCODINGS],
-                 help_text="控制二進位 message.dat 文字欄位的解碼方式。匯出的 TXT 固定為 UTF-8。")
-write_enc = field("write_encoding", "回寫 新message.dat 之編碼", "choice", True, "gbk",
-                  [(label, value) for label, value in ENCODINGS],
-                  help_text="匯入時將修改後文字寫回 message.dat 所使用的編碼；TXT 本身仍以 UTF-8 讀取。")
+
+# 「ini」代表不傳送 CLI 編碼參數，由 MessageCommands.cs 依 INI Profile／EXE 預設處理。
+read_enc = field(
+    "read_encoding",
+    "讀取 原message.dat 之編碼",
+    "choice",
+    True,
+    "ini",
+    [("依 INI／EXE 預設", "ini"), *ENCODINGS],
+    help_text="預設沿用 INI Profile／EXE 內建編碼；也可以明確指定二進位 message.dat 的解碼方式。匯出的 TXT 固定為 UTF-8。"
+)
+write_enc = field(
+    "write_encoding",
+    "回寫 新message.dat 之編碼",
+    "choice",
+    True,
+    "ini",
+    [("依 INI／EXE 預設", "ini"), *ENCODINGS],
+    help_text="預設沿用 INI Profile／EXE 編碼設定；也可以明確指定寫回 message.dat 的編碼。TXT 本身仍以 UTF-8 讀取。"
+)
+
+# 以 choice_flags 控制是否傳送 CLI 編碼參數。
+# 選擇「依 INI／EXE 預設」時，對應空清單，不會送出任何編碼參數。
+msg_read_encoding_flags = {
+    "ini": [],
+    **{value: ["--read-encoding", value] for _, value in ENCODINGS},
+}
+msg_write_encoding_flags = {
+    "ini": [],
+    **{value: ["--write-encoding", value] for _, value in ENCODINGS},
+}
+
 msg_workflow = [field("no_workflow", "略過自動文字工作流程（長度修正／占位符處理）", "check", False)]
 
 OPS += [
     op("訊息", "message.dat 匯出 TXT", ["msg", "export"],
-       "讀取 message.dat 並匯出 UTF-8 TXT。可直接在 GUI 選擇 GBK、UTF-8、Shift-JIS 或 Big5。",
+       "讀取 message.dat 並匯出 UTF-8 TXT。預設沿用 INI／EXE 編碼設定，也可明確指定 GBK、UTF-8、Shift-JIS 或 Big5。",
        [field("src", "輸入 message.dat", "file", extensions=FILE_DAT), field("dst", "輸出 TXT（UTF-8）", "save_file", extensions=FILE_TXT),
         read_enc, ini_field, msg_workflow[0]], ["src", "dst"],
-       options=[("read_encoding", "--read-encoding"), ("ini", "--ini")], flags=[("no_workflow", "--no-workflow")]),
+       options=[("ini", "--ini")],
+       flags=[("no_workflow", "--no-workflow")],
+       choice_flags=[("read_encoding", msg_read_encoding_flags)]),
     op("訊息", "message.dat 匯入 TXT", ["msg", "import"],
        "將 UTF-8 TXT 匯入原始 message.dat 並輸出新 DAT。輸出路徑必須與原檔分開；啟用自動工作流程時，CLI 也可能在翻譯 TXT 旁產生 message_fix.txt。",
        [field("src", "原始 message.dat", "file", extensions=FILE_DAT), field("txt", "翻譯 TXT（UTF-8）", "file", extensions=FILE_TXT),
@@ -149,28 +177,45 @@ OPS += [
         field("encrypt", "加密設定", "choice", True, "ini", [("依 INI／原檔預設", "ini"), ("啟用加密", "true"), ("停用加密", "false")]),
         field("xor_key", "XOR Key（十六進位，可留空使用預設）", "text", False),
         field("no_workflow", "略過自動文字工作流程", "check", False)], ["src", "txt", "dst"],
-       options=[("read_encoding", "--read-encoding"), ("write_encoding", "--write-encoding"), ("ini", "--ini"), ("xor_key", "--xor-key")],
+       options=[("ini", "--ini"), ("xor_key", "--xor-key")],
        flags=[("no_workflow", "--no-workflow")],
-       choice_flags=[("encrypt", {"ini": [], "true": ["--encrypt", "true"], "false": ["--encrypt", "false"]})]),
+       choice_flags=[
+           ("read_encoding", msg_read_encoding_flags),
+           ("write_encoding", msg_write_encoding_flags),
+           ("encrypt", {"ini": [], "true": ["--encrypt", "true"], "false": ["--encrypt", "false"]}),
+       ]),
     op("訊息", "message.dat 二進位驗證", ["msg", "verify"], "檢查 message.dat 是否能完成二進位 byte-for-byte 回環。",
        [field("src", "輸入 message.dat", "file", extensions=FILE_DAT), read_enc, write_enc, ini_field], ["src"],
-       options=[("read_encoding", "--read-encoding"), ("write_encoding", "--write-encoding"), ("ini", "--ini")]),
+       options=[("ini", "--ini")],
+       choice_flags=[
+           ("read_encoding", msg_read_encoding_flags),
+           ("write_encoding", msg_write_encoding_flags),
+       ]),
     op("訊息", "message.dat 文字回環驗證", ["msg", "verify-text"], "檢查 message.dat 的文字匯出／匯入回環。",
        [field("src", "輸入 message.dat", "file", extensions=FILE_DAT), read_enc, write_enc, ini_field], ["src"],
-       options=[("read_encoding", "--read-encoding"), ("write_encoding", "--write-encoding"), ("ini", "--ini")]),
+       options=[("ini", "--ini")],
+       choice_flags=[
+           ("read_encoding", msg_read_encoding_flags),
+           ("write_encoding", msg_write_encoding_flags),
+       ]),
     op("訊息", "message.dat 結構摘要", ["msg", "dump"], "輸出 message.dat 的格式、版本與結構摘要。",
        [field("src", "輸入 message.dat", "file", extensions=FILE_DAT), read_enc, ini_field], ["src"],
-       options=[("read_encoding", "--read-encoding"), ("ini", "--ini")]),
+       options=[("ini", "--ini")],
+       choice_flags=[("read_encoding", msg_read_encoding_flags)]),
     op("訊息", "建立 message／SCR 對照 JSON", ["msg", "map"], "建立 message.dat 與 .scr 腳本之間的引用對照。",
        [field("src", "輸入 message.dat", "file", extensions=FILE_DAT), field("scr_dir", "SCR 資料夾", "dir"),
         field("dst", "輸出對照 JSON", "save_file", extensions=FILE_JSON), read_enc, ini_field,
         field("no_workflow", "略過文字工作流程", "check", False)], ["src", "scr_dir", "dst"],
-       options=[("read_encoding", "--read-encoding"), ("ini", "--ini")], flags=[("no_workflow", "--no-workflow")]),
+       options=[("ini", "--ini")],
+       flags=[("no_workflow", "--no-workflow")],
+       choice_flags=[("read_encoding", msg_read_encoding_flags)]),
     op("訊息", "依 SCR 拆分 message 文字", ["msg", "split"], "依 .scr 腳本引用情況拆分訊息，輸出共享、孤立與個別腳本文字。",
        [field("src", "輸入 message.dat", "file", extensions=FILE_DAT), field("scr_dir", "SCR 資料夾", "dir"),
         field("dst", "輸出資料夾", "save_dir"), read_enc, ini_field,
         field("no_workflow", "略過文字工作流程", "check", False)], ["src", "scr_dir", "dst"],
-       options=[("read_encoding", "--read-encoding"), ("ini", "--ini")], flags=[("no_workflow", "--no-workflow")]),
+       options=[("ini", "--ini")],
+       flags=[("no_workflow", "--no-workflow")],
+       choice_flags=[("read_encoding", msg_read_encoding_flags)]),
     op("訊息", "合併拆分後的 message TXT", ["msg", "merge"], "將 base-message.txt 與拆分資料夾合併成完整 message TXT。",
        [field("base", "基礎 message TXT", "file", extensions=FILE_TXT), field("split_dir", "拆分資料夾", "dir"),
         field("dst", "輸出合併 TXT", "save_file", extensions=FILE_TXT)], ["base", "split_dir", "dst"]),
@@ -1630,3 +1675,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
