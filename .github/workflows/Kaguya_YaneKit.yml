@@ -1,4 +1,3 @@
-
 name: Kaguya_YaneKit EXE Build
 
 on:
@@ -25,7 +24,7 @@ jobs:
       PUBLISH_DIR: artifacts/Kaguya_YaneKit
 
     steps:
-      # 1. 只 Checkout Kaguya_YaneKit，避免展開整個 Repository
+      # 1. 只 Checkout Kaguya_YaneKit，避免展开整个 Repository
       - name: Checkout
         uses: actions/checkout@v7
         with:
@@ -34,19 +33,19 @@ jobs:
           sparse-checkout-cone-mode: false
           submodules: false
 
-      # 2. 安裝 .NET 8 SDK
+      # 2. 安装 .NET 8 SDK
       - name: Setup .NET
         uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 8.0.x
 
-      # 3. 還原 NuGet 套件
+      # 3. 还原 NuGet 套件
       - name: Restore
         shell: pwsh
         run: |
           dotnet restore "$env:PROJECT_FILE" --runtime win-x64
 
-      # 4. 發布 Windows x64 單檔 EXE
+      # 4. 发布 Windows x64 单档 EXE
       - name: Publish
         shell: pwsh
         run: |
@@ -62,7 +61,7 @@ jobs:
             -p:DebugType=None `
             -p:DebugSymbols=false
 
-      # 5. 複製必要設定檔
+      # 5. 複製並驗證必要設定檔
       - name: Copy Configuration Files
         shell: pwsh
         run: |
@@ -83,23 +82,50 @@ jobs:
             -Recurse `
             -Force
 
-          # 確認必要設定檔
-          $requiredConfigs = @(
-              "message_config.ini",
-              "tblstr_config.ini"
-          )
+          $messagePath = Join-Path $targetIni "message_config.ini"
+          $tblstrPath = Join-Path $targetIni "tblstr_config.ini"
 
-          foreach ($config in $requiredConfigs) {
-              $configPath = Join-Path $targetIni $config
-
-              if (-not (Test-Path -LiteralPath $configPath)) {
-                  throw "Missing required configuration: $config"
+          foreach ($configPath in @($messagePath, $tblstrPath)) {
+              if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+                  throw "Missing required configuration: $configPath"
               }
-
-              Write-Host "Verified: $config"
+              Write-Host "Verified file: $configPath"
           }
 
-      # 6. 執行基本啟動測試
+          $messageText = Get-Content -LiteralPath $messagePath -Raw -Encoding UTF8
+          if ($messageText -notmatch '(?im)^\s*MsgLengthCheck\s*=\s*True\s*$') {
+              throw "message_config.ini must keep length checking enabled."
+          }
+          if ($messageText -notmatch '(?im)^\s*MsgLengthFix\s*=\s*False\s*$') {
+              throw "message_config.ini must disable automatic line wrapping."
+          }
+          if ($messageText -match '(?im)^\s*Encrypt(Enabled|Key)\s*=') {
+              throw "message_config.ini must not force encryption/decryption or override the source XOR key by default."
+          }
+
+          $tblstrText = Get-Content -LiteralPath $tblstrPath -Raw -Encoding UTF8
+          if ($tblstrText -notmatch '(?im)^\s*ConfigurationID\s*=\s*0\s*$') {
+              throw "tblstr_config.ini is missing ConfigurationID=0."
+          }
+          if ($tblstrText -notmatch '(?m)^\s*■\[0\]\[') {
+              throw "tblstr_config.ini is missing the active profile section."
+          }
+          if ($tblstrText -notmatch '(?im)^\s*MsgLengthCheck\s*=\s*True\s*$') {
+              throw "tblstr_config.ini must keep length checking enabled."
+          }
+          if ($tblstrText -notmatch '(?im)^\s*MsgLengthFix\s*=\s*False\s*$') {
+              throw "tblstr_config.ini must disable automatic line wrapping."
+          }
+          if ($tblstrText -notmatch '(?ims)■\[0\]\[[^\r\n]*\][\s\S]*?^\s*ReadingEncoding\s*=\s*cp932\s*$') {
+              throw "tblstr_config.ini ReadingEncoding must be inside the active profile."
+          }
+          if ($tblstrText -notmatch '(?ims)■\[0\]\[[^\r\n]*\][\s\S]*?^\s*WritingEncoding\s*=\s*cp932\s*$') {
+              throw "tblstr_config.ini WritingEncoding must be inside the active profile."
+          }
+
+          Write-Host "Configuration defaults verified."
+
+      # 6. 执行基本启动测试
       - name: Smoke Test
         shell: pwsh
         run: |
@@ -117,7 +143,7 @@ jobs:
 
           Write-Host "Executable startup test passed."
 
-      # 7. 上傳編譯產物
+      # 7. 上传编译产物
       - name: Upload Artifact
         uses: actions/upload-artifact@v7
         with:
