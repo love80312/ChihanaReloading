@@ -8,6 +8,7 @@ using System.Text.Json;
 using Kaguya_YaneKit.App;
 using Kaguya_YaneKit.Formats.Archive;
 using Kaguya_YaneKit.Formats.Picture;
+using Kaguya_YaneKit.Text.MessageDat;
 
 namespace Kaguya_YaneKit.Core;
 
@@ -28,6 +29,7 @@ internal static class SafePathSelfTest
             TestArchiveAtomicReplacement(testRoot);
             TestRuntimeContextLazyParams(testRoot);
             TestLinkParamsKeySelection();
+            TestMessageEncodingPrecedence(testRoot);
             TestRestoreAndReplenish(testRoot);
 
             Console.WriteLine("PASS: SafePath traversal, invalid-name, and reparse-point checks.");
@@ -36,6 +38,7 @@ internal static class SafePathSelfTest
             Console.WriteLine("PASS: Runtime Context can retain params.dat path without parsing its contents.");
             Console.WriteLine("PASS: Explicit LINK --params takes precedence over a cached context key.");
             Console.WriteLine("PASS: Explicit game root without params.dat disables cross-game LINK key fallback.");
+            Console.WriteLine("PASS: Explicit CLI message encodings override INI profile values.");
             Console.WriteLine("PASS: Restorer atomic replacement, replenish, and timestamps.");
             Console.WriteLine("All Kaguya_YaneKit core self-tests passed.");
             return 0;
@@ -301,6 +304,79 @@ internal static class SafePathSelfTest
 
         Assert(ReferenceEquals(cachedKey, withoutExplicitPath), "LINK did not preserve the context key when no explicit params path was supplied.");
         Assert(withExplicitPath is null, "LINK reused the context key even though an explicit params path was supplied.");
+    }
+
+    private static void TestMessageEncodingPrecedence(string testRoot)
+    {
+        var iniPath = Path.Combine(testRoot, "message-encoding.ini");
+        File.WriteAllText(
+            iniPath,
+            string.Join(
+                Environment.NewLine,
+                new[]
+                {
+                    "ConfigurationID=0",
+                    "■[0][Self-test]",
+                    "ReadingEncoding=cp932",
+                    "WritingEncoding=utf-8"
+                }));
+
+        var config = MessagePlaceholderConfig.Load(iniPath);
+
+        // 沒有 CLI 編碼參數時，應使用 INI Profile。
+        var iniOnly = MessageCommands.ResolveEncodingNames(
+            config,
+            ["export", "input.dat", "output.txt"]);
+
+        Assert(
+            iniOnly.ReadEncodingName == "cp932",
+            "INI reading encoding was not used when CLI omitted --read-encoding.");
+        Assert(
+            iniOnly.WriteEncodingName == "utf-8",
+            "INI writing encoding was not used when CLI omitted --write-encoding.");
+
+        // CLI 明確指定讀取 GBK 時，必須覆蓋 INI 的 CP932。
+        var cliRead = MessageCommands.ResolveEncodingNames(
+            config,
+            ["export", "input.dat", "output.txt", "--read-encoding", "gbk"]);
+
+        Assert(
+            cliRead.ReadEncodingName == "gbk",
+            "Explicit CLI --read-encoding did not override the INI profile.");
+        Assert(
+            cliRead.WriteEncodingName == "utf-8",
+            "CLI read override unexpectedly changed the INI writing encoding.");
+
+        // CLI 明確指定寫入 Big5 時，必須覆蓋 INI 的 UTF-8。
+        var cliWrite = MessageCommands.ResolveEncodingNames(
+            config,
+            ["import", "input.dat", "input.txt", "output.dat", "--write-encoding", "big5"]);
+
+        Assert(
+            cliWrite.ReadEncodingName == "cp932",
+            "CLI write override unexpectedly changed the INI reading encoding.");
+        Assert(
+            cliWrite.WriteEncodingName == "big5",
+            "Explicit CLI --write-encoding did not override the INI profile.");
+
+        // 同時指定兩項時，兩者都必須以 CLI 參數為準。
+        var bothCli = MessageCommands.ResolveEncodingNames(
+            config,
+            [
+                "import",
+                "input.dat",
+                "input.txt",
+                "output.dat",
+                "--read-encoding",
+                "gbk",
+                "--write-encoding",
+                "big5"
+            ]);
+
+        Assert(
+            bothCli.ReadEncodingName == "gbk" &&
+            bothCli.WriteEncodingName == "big5",
+            "Explicit CLI read/write encodings were not both applied.");
     }
 
     private static void TestRestoreAndReplenish(string testRoot)
