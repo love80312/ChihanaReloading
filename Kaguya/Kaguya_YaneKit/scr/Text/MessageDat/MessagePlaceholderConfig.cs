@@ -30,8 +30,12 @@ public sealed class MessagePlaceholderConfig
     public IReadOnlyDictionary<string, byte[]> PlaceholderToBytes => _placeholderToBytes;
     public string? ReadEncodingName { get; private set; }
     public string? WriteEncodingName { get; private set; }
-    public bool? EncryptEnabled { get; private set; } = true;
-    public byte? EncryptKey { get; private set; } = 0xff;
+
+    // null 表示不覆寫來源檔設定；匯入時沿用原始 DAT 的加密狀態與 XOR 金鑰。
+    // 只有 INI 明確指定 EncryptEnabled / EncryptKey 時，才強制使用指定值。
+    public bool? EncryptEnabled { get; private set; }
+    public byte? EncryptKey { get; private set; }
+
     public bool AdjustBranchMessages { get; private set; }
     public int AdjustMsgId { get; private set; } = 1;
     public bool AdjustMsgDetails { get; private set; }

@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -28,6 +28,7 @@
 
   <ItemGroup>
     <None Include="ini\message_config.ini" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="ini\tblstr_config.ini" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>
