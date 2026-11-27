@@ -1,11 +1,11 @@
 /* chihana_gbk.c -- version.dll 代理 DLL：讓 Kaguya 遊戲在簡中區域(ACP 936)下正確顯示指定 GBK 欄位
  *
- * ChihanaGBK v2.4.1.9
+ * ChihanaGBK v2.4.2.0
  *
- * 本版本以 v2.4.1.8 為基礎，只增加 WCTMB 診斷：
- *   1. 記錄 WideCharToMultiByte 呼叫返回位址及主 EXE RVA。
- *   2. 配對同一執行緒緊接在前、參數相同的容量查詢與實際轉換。
- *   3. 記錄需求容量、實際容量及差額，不更動轉換參數或緩衝區。
+ * 本版本以 v2.4.1.9 為基礎，只增加 WCTMB 目的緩衝區診斷：
+ *   1. 保留容量查詢與實際轉換的配對資訊。
+ *   2. Debug=2 時，擷取 WCTMB 呼叫前後的目的緩衝區內容。
+ *   3. 最多讀取 96 bytes，且不超過呼叫端提供的 sl；不寫入目的緩衝區。
  *
  * 保留：CP936 / CP932 路由、五個 params ReaderWrap、FLS、
  * GBK 標點及全形空白修補、字型 Hook、UTF-8 Log 與 LastError 保護。
@@ -451,6 +451,50 @@ static void hex_(
     dst[o] = 0;
 }
 
+/*
+ * 僅供 Debug=2 診斷使用。
+ * 透過 ReadProcessMemory 讀取目前程序的目的緩衝區，避免直接解參考
+ * 無效位址；讀取長度不超過呼叫端提供的 capacity，也不超過本地快照容量。
+ * 保留呼叫前的 LastError，避免診斷讀取影響後續 WCTMB。
+ */
+#define WCTMB_DIAG_CAPTURE_MAX 96
+
+static BOOL snapshot_output_buffer(
+    LPCSTR source,
+    int capacity,
+    BYTE *buffer,
+    SIZE_T buffer_capacity,
+    SIZE_T *bytes_read
+) {
+    DWORD saved_error = GetLastError();
+    SIZE_T request = 0;
+    SIZE_T got = 0;
+    BOOL ok = FALSE;
+
+    if (bytes_read)
+        *bytes_read = 0;
+
+    if (source && capacity > 0 && buffer && buffer_capacity > 0) {
+        request = (SIZE_T)capacity;
+        if (request > buffer_capacity)
+            request = buffer_capacity;
+
+        ok = ReadProcessMemory(
+            GetCurrentProcess(),
+            (LPCVOID)source,
+            buffer,
+            request,
+            &got
+        );
+
+        if (bytes_read)
+            *bytes_read = got;
+    }
+
+    SetLastError(saved_error);
+    return ok && got == request;
+}
+
 /* ---------------- hooks ---------------- */
 
 typedef HFONT (WINAPI *PFN_CFIA)(
@@ -661,6 +705,25 @@ static int WINAPI My_WCTMB(
     if (cp == CP_THREAD_ACP)
         cp = in_reader ? 936 : 932;
 
+    /*
+     * 僅在 Debug=2、ReaderWrap 範圍內追蹤目的緩衝區。
+     * 快照只讀取 min(sl, 96) bytes，絕不修改遊戲緩衝區。
+     */
+    BOOL capture_destination =
+        (g_debug >= 2 && in_reader && ws && s && sl > 0);
+
+    BYTE destination_before[WCTMB_DIAG_CAPTURE_MAX];
+    SIZE_T destination_before_read = 0;
+    BOOL destination_before_ok = FALSE;
+
+    if (capture_destination) {
+        memset(destination_before, 0, sizeof(destination_before));
+        destination_before_ok = snapshot_output_buffer(
+            s, sl, destination_before, sizeof(destination_before),
+            &destination_before_read
+        );
+    }
+
     int r = real_WCTMB(
         cp,
         fl,
@@ -678,6 +741,51 @@ static int WINAPI My_WCTMB(
 
         char w[300];
         char o[300];
+
+        BYTE destination_after[WCTMB_DIAG_CAPTURE_MAX];
+        SIZE_T destination_after_read = 0;
+        BOOL destination_after_ok = FALSE;
+        SIZE_T destination_snapshot_request = 0;
+        int destination_changed = -1;
+        char destination_before_hex[300] = "<skip>";
+        char destination_after_hex[300] = "<skip>";
+
+        if (capture_destination) {
+            memset(destination_after, 0, sizeof(destination_after));
+            destination_snapshot_request = (SIZE_T)sl;
+            if (destination_snapshot_request > WCTMB_DIAG_CAPTURE_MAX)
+                destination_snapshot_request = WCTMB_DIAG_CAPTURE_MAX;
+
+            destination_after_ok = snapshot_output_buffer(
+                s, sl, destination_after, sizeof(destination_after),
+                &destination_after_read
+            );
+
+            if (destination_before_read > 0)
+                hex_(destination_before_hex, sizeof(destination_before_hex),
+                     destination_before, (int)destination_before_read);
+            else
+                lstrcpynA(destination_before_hex, "<unreadable>",
+                          sizeof(destination_before_hex));
+
+            if (destination_after_read > 0)
+                hex_(destination_after_hex, sizeof(destination_after_hex),
+                     destination_after, (int)destination_after_read);
+            else
+                lstrcpynA(destination_after_hex, "<unreadable>",
+                          sizeof(destination_after_hex));
+
+            if (destination_before_read > 0 && destination_after_read > 0) {
+                SIZE_T compare_count =
+                    destination_before_read < destination_after_read
+                    ? destination_before_read : destination_after_read;
+                destination_changed = 0;
+                for (SIZE_T i = 0; i < compare_count; i++) {
+                    if (destination_before[i] != destination_after[i])
+                        destination_changed++;
+                }
+            }
+        }
 
         int n = wl;
 
@@ -716,7 +824,7 @@ static int WINAPI My_WCTMB(
 
             if (is_query) {
 
-                /* 只保存成功查詢，供同執行緒下一次轉換配對。 */
+                /* 只保存成功查詢，供同執行緒下一次實際轉換配對。 */
                 state->wctmbQueryValid = (r > 0);
 
                 if (r > 0) {
@@ -756,7 +864,7 @@ static int WINAPI My_WCTMB(
             }
         }
 
-        /* 只有 API 成功時才讀取輸出緩衝區。 */
+        /* 只有 API 成功時才記錄轉換結果，避免將未定義資料誤判為輸出。 */
         if (r > 0 && s && sl > 0) {
 
             int out_len = r;
@@ -783,7 +891,7 @@ static int WINAPI My_WCTMB(
         }
 
         logf_(
-            "WCTMB kind=%s caller=%08lX rva=%08lX query_rva=%08lX paired=%d need=%d sl=%d gap=%d in=%u->cp=%u wl=%d r=%d err=%lu src=%p dst=%p | UTF16: %s| out: %s",
+            "WCTMB kind=%s caller=%08lX rva=%08lX query_rva=%08lX paired=%d need=%d sl=%d gap=%d in=%u->cp=%u wl=%d r=%d err=%lu src=%p dst=%p dst_req=%lu pre_read=%lu pre_ok=%d pre=%s post_read=%lu post_ok=%d post=%s changed=%d | UTF16: %s| out: %s",
             is_query ? "QUERY" : (s ? "CONVERT" : "OTHER"),
             (unsigned long)caller,
             (unsigned long)caller_rva,
@@ -799,6 +907,14 @@ static int WINAPI My_WCTMB(
             (unsigned long)(r == 0 ? api_error : 0),
             (const void *)ws,
             (void *)s,
+            (unsigned long)destination_snapshot_request,
+            (unsigned long)destination_before_read,
+            destination_before_ok,
+            destination_before_hex,
+            (unsigned long)destination_after_read,
+            destination_after_ok,
+            destination_after_hex,
+            destination_changed,
             w,
             o
         );

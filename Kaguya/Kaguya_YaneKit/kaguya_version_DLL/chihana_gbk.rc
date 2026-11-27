@@ -20,7 +20,7 @@ BEGIN
             VALUE "ProductVersion",   CHIHANA_VER_STR
             VALUE "InternalName",     "version.dll"
             VALUE "OriginalFilename", "version.dll"
-            VALUE "Comments",         "版本 " CHIHANA_VER_STR "（" CHIHANA_BUILD_DATE "）。ReaderWrap 內使用 CP936，其他文字維持 CP932；WCTMB 呼叫點診斷；不支援 Big5 950。"
+            VALUE "Comments",         "版本 " CHIHANA_VER_STR "（" CHIHANA_BUILD_DATE "）。ReaderWrap 內使用 CP936，其他文字維持 CP932；WCTMB 呼叫點及目的緩衝區前後快照診斷；不支援 Big5 950。"
             VALUE "LegalCopyright",   "ChihanaGBK 本地化輔助工具，僅供個人學習與本地化使用"
             VALUE "PrivateBuild",     CHIHANA_BUILD_DATE
         END

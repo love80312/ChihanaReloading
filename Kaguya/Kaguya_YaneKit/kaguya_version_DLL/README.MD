@@ -1,8 +1,8 @@
-# ChihanaGBK v2.4.1.9
+# ChihanaGBK v2.4.2.0
 
 Kaguya 引擎用 x86 `version.dll` 代理 DLL。
 
-本版以 v2.4.1.8 為基礎，固定使用 CP936，不提供 Big5 950 或 CodePage 切換。此版本只增加 `WideCharToMultiByte`（WCTMB）呼叫點及查詢／實際轉換配對診斷，不改變轉碼參數、緩衝區、API 回傳值或字型行為。
+本版以 v2.4.1.9 為基礎，固定使用 CP936，不提供 Big5 950 或 CodePage 切換。此版本只增加 `WideCharToMultiByte`（WCTMB）目的緩衝區診斷，不改變轉碼參數、目的緩衝區內容、API 回傳值或字型行為。
 
 ## 編碼行為
 
@@ -49,20 +49,26 @@ ExtraSites=
 
 ## WCTMB 診斷（Debug=2）
 
-每筆 WCTMB 診斷會額外記錄：
+每筆 WCTMB 診斷會記錄：
 
 - `caller`：呼叫返回位址。
 - `rva`：返回位址相對於主 EXE 的 RVA；`FFFFFFFF` 代表呼叫位置不在主 EXE 映像內。
 - `kind`：`QUERY` 是需求長度查詢；`CONVERT` 是實際輸出轉換。
-- `paired`：是否與同一執行緒緊接在前、且來源字串與轉換參數相同的查詢配對。
+- `paired`：是否與同一執行緒、來源字串指標及轉換參數相同的查詢配對。
 - `query_rva`：配對到的查詢返回位址 RVA。
 - `need`：查詢得到的需求容量。
-- `sl`：遊戲實際提供的輸出容量。
+- `sl`：遊戲實際提供給 WCTMB 的目的緩衝區容量。
 - `gap`：`need - sl`；正數代表容量不足，0 或負數代表容量足夠。
+- `dst_req`：目的緩衝區快照長度，等於 `min(sl, 96)`。
+- `pre_read`／`pre_ok`／`pre`：呼叫前讀取的 bytes 數、是否完整讀取及原始位元組。
+- `post_read`／`post_ok`／`post`：呼叫後讀取的 bytes 數、是否完整讀取及原始位元組。
+- `changed`：前後快照可比較範圍內，內容不同的 byte 數；`-1` 代表無法比較。
 
-當 `wl=-1` 且輸出指標為 NULL、容量為 0 時，WideCharToMultiByte 的需求長度包含結尾 NUL。若實際轉換容量少 1 byte，API 會回傳 0，並設定錯誤碼 122（`ERROR_INSUFFICIENT_BUFFER`）。
+當 `wl=-1` 且輸出指標為 NULL、容量為 0 時，WideCharToMultiByte 的需求長度包含結尾 NUL。實際轉換容量不足時，API 會回傳 0，並以 `GetLastError()` 提供錯誤資訊；錯誤碼 122 代表輸出容量不足。
 
-本診斷版不擅自擴張或替換遊戲提供的緩衝區，不補寫 NUL，不改變 API 回傳值或原始參數。查詢與轉換只有在同一執行緒、來源字串指標及轉換參數相符時才會配對；未配對不代表轉換一定失敗。
+只有在 `Debug=2`、ReaderWrap 範圍內且目的指標與容量有效時，才會擷取前後快照。快照使用 `ReadProcessMemory` 讀取目前程序，讀取長度不超過遊戲傳入的 `sl`，並限制最多 96 bytes。若記憶體區段不可讀，會記錄 `<unreadable>`，不直接解參考該位址。
+
+本診斷版不寫入目的緩衝區、不擴大容量、不補寫 NUL，不改變 WCTMB 的原始參數、回傳值或 LastError。前後快照只用來確認 API 呼叫期間目的緩衝區是否發生變化，不應單憑快照內容認定轉換結果有效。查詢與轉換只有在同一執行緒、來源字串指標及轉換參數相符時才會配對。
 
 ## 原有功能
 
@@ -72,6 +78,6 @@ ExtraSites=
 
 ## 建置與測試
 
-目標為 Windows x86 Release。使用專案既有 GitHub Actions 手動建置；安裝時將 `version.dll` 與 `ChihanaGBK.ini` 放在遊戲 `Start.exe` 同一資料夾。
+目標為 Windows x86 Release。使用 GitHub Actions 的手動 `workflow_dispatch` 重新建置；安裝時將 `version.dll` 與原有 `ChihanaGBK.ini` 放在遊戲 `Start.exe` 同一資料夾。
 
-本診斷版尚未經 GitHub Actions 編譯及目標遊戲實機測試。請設定 `Debug=2` 執行遊戲，重現有 WCTMB `122` 的情況後，提供新的 `ChihanaGBK.log`。
+本版原始碼更新後，請使用 GitHub Actions 手動建置 x86 Release DLL。建置成功後，使用本機 `Debug=2` 設定進行目標遊戲實測，提供新的 `ChihanaGBK.log`。本次快照僅供診斷，尚未修改緩衝區不足的處理方式。
