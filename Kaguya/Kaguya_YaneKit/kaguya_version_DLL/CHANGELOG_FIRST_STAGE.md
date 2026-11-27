@@ -1,3 +1,25 @@
+# v2.4.1.3 修正紀錄
+
+## 修正原因
+
+- v2.4.1.2 在 `EncodingEnabled=0` 時連 `WideCharToMultiByte` IAT hook 一併關閉，導致一般文字回到 Locale Emulator 的執行緒 ACP；在簡中 ACP 環境下，日文 `message.dat` 可能因此亂碼。
+
+## 本版修正
+
+- `WideCharToMultiByte` hook 在兩種模式都保留。
+- 一般 `CP_THREAD_ACP` 一律轉成 CP932；只有 `EncodingEnabled=1` 且位於五個 params ReaderWrap 欄位時才轉成 CP936。
+- `EncodingEnabled=0` 仍完全略過 params 掃描、ReaderWrap、ExtraSites，以及 GBK 專用標點／全形空白修補。
+- 字型 hook、動態載入模組字型 hook、Face/Charset/Weight/HeightScale 均保持啟用。
+- INI 的 `[Options]` 移至第一個區塊，`EncodingEnabled=1` 成為最上方第一個設定值。
+
+## 保留與驗證
+
+- `kaguya_scan.h`、ReaderWrap 組語、FLS 狀態管理、InitOnce、版本 API 匯出及 `pxxxx.dat`／`message.dat` 資料讀取程式未修改。
+- 本次功能修正集中在 CP_THREAD_ACP 對應邏輯與 WCTMB IAT hook 不再隨開關移除。
+- 仍須用 `EncodingEnabled=0` 的日文 EXE 實測 message.dat，並用 `EncodingEnabled=1` 回歸測試 Kaguya 5.7／5.8。
+
+---
+
 # v2.4.1.2 修正紀錄
 
 ## 新增功能
