@@ -1,0 +1,178 @@
+name: ChihanaGBK version.dll Build
+
+# 獨立 DLL 建置：只允許手動執行，不會因 push 自動觸發。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ChihanaGBK x86 DLL
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    env:
+      SOURCE_DIR: Kaguya/Kaguya_YaneKit/kaguya_version_DLL
+      BUILD_DIR: build/ChihanaGBK-x86
+      OUTPUT_DIR: artifacts/ChihanaGBK-x86
+
+    steps:
+      - name: Checkout DLL source only
+        uses: actions/checkout@v7
+        with:
+          # 手動執行時，依 Actions 頁面選擇的分支取原始碼。
+          ref: ${{ github.ref }}
+          sparse-checkout: |
+            /Kaguya/Kaguya_YaneKit/kaguya_version_DLL/
+          sparse-checkout-cone-mode: false
+          submodules: false
+
+      - name: Install 32-bit MinGW-w64 cross compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mingw-w64-i686 \
+            binutils-mingw-w64-i686
+
+      - name: Verify source files
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in \
+            chihana_gbk.c \
+            chihana_gbk.rc \
+            chihana_version.h \
+            kaguya_scan.h; do
+            if [[ ! -f "$SOURCE_DIR/$file" ]]; then
+              echo "Missing source file: $SOURCE_DIR/$file" >&2
+              exit 1
+            fi
+          done
+          mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
+
+      - name: Compile version resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          i686-w64-mingw32-windres \
+            --codepage=65001 \
+            -i "$SOURCE_DIR/chihana_gbk.rc" \
+            -O coff \
+            -o "$BUILD_DIR/chihana_gbk_res.o"
+
+      - name: Build x86 version.dll
+        shell: bash
+        run: |
+          set -euo pipefail
+          i686-w64-mingw32-gcc \
+            -std=gnu11 \
+            -O2 \
+            -Wall \
+            -Wextra \
+            -Wno-deprecated-declarations \
+            -shared \
+            -static-libgcc \
+            -Wl,--kill-at \
+            -Wl,--enable-stdcall-fixup \
+            -Wl,--no-undefined \
+            -Wl,--subsystem,windows \
+            -o "$OUTPUT_DIR/version.dll" \
+            "$SOURCE_DIR/chihana_gbk.c" \
+            "$BUILD_DIR/chihana_gbk_res.o" \
+            -lkernel32 \
+            -luser32 \
+            -lgdi32
+
+      - name: Verify DLL architecture and exports
+        shell: bash
+        run: |
+          set -euo pipefail
+          DLL="$OUTPUT_DIR/version.dll"
+
+          if [[ ! -s "$DLL" ]]; then
+            echo "version.dll was not generated." >&2
+            exit 1
+          fi
+
+          i686-w64-mingw32-objdump -f "$DLL" | tee "$BUILD_DIR/file-info.txt"
+          if ! grep -q "pei-i386" "$BUILD_DIR/file-info.txt"; then
+            echo "The output is not a 32-bit x86 Windows PE file." >&2
+            exit 1
+          fi
+
+          i686-w64-mingw32-objdump -p "$DLL" > "$BUILD_DIR/exports.txt"
+          for symbol in \
+            GetFileVersionInfoA \
+            GetFileVersionInfoSizeA \
+            VerQueryValueA; do
+            if ! grep -Fq "$symbol" "$BUILD_DIR/exports.txt"; then
+              echo "Required export not found: $symbol" >&2
+              cat "$BUILD_DIR/exports.txt"
+              exit 1
+            fi
+          done
+
+          echo "DLL architecture and required exports verified."
+
+      - name: Package DLL, INI and build documentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$SOURCE_DIR/README.MD" "$OUTPUT_DIR/README.MD"
+
+          # 遊戲啟動時會從 Start.exe 所在資料夾讀取 ChihanaGBK.ini。
+          # 將預設設定直接放進 Artifact，與 version.dll 一起交付。
+          cat > "$OUTPUT_DIR/ChihanaGBK.ini" <<'INI'
+          ; 與 start.exe、version.dll 放在同一個資料夾。
+          ; 改完存檔，重新啟動遊戲即生效，不需重新產生檔案。
+
+          [Font]
+          ; 字型名稱（家族名稱，需已安裝在系統）。
+          ; 英文名最穩，例如 SimHei、SimSun、KaiTi、Microsoft YaHei、Sarasa Gothic SC
+          Face=LXGW Wenkai TC Medium
+
+          ; 134 = GB2312（預設）。
+          ; 若指定的字型沒生效，可試 1 (DEFAULT_CHARSET)
+          Charset=134
+
+          ; 粗細：遊戲預設 300（偏細）。填 400 = 一般；0 = 不改。粗體(700)不受影響
+          Weight=0
+
+          ; 字高縮放百分比：100 = 不改，110 = 放大 10%。排版是遊戲自己算的，放太大可能超出文字框
+          HeightScale=100
+
+          [Params]
+          ; 額外要改用 GBK(936) 轉碼的 params.dat 欄位讀取點位址（逗號分隔，例如 0x42CA25）。
+          ; 標題/品牌/預設姓名共 5 個欄位會在載入時自動掃描，通常不用填
+          ExtraSites=
+
+          [Options]
+          ; 1 = 在同資料夾寫出 ChihanaGBK.log，記錄各項 hook 是否成功
+          ; 2 = 另外記錄 params 字串的轉碼前後位元組與視窗標題位元組（排查亂碼/多餘字元用，會寫很多行，查完請改回 0）
+          Debug=0
+          INI
+
+          cat > "$OUTPUT_DIR/BUILD_INFO.txt" <<'EOF'
+          Product: ChihanaGBK version.dll
+          Architecture: Windows x86 (32-bit, Intel 80386)
+          Compiler: MinGW-w64 i686 GCC
+          Version: Defined by chihana_version.h
+          Build type: Independent DLL build; not part of Kaguya_YaneKit.exe
+          Included configuration: ChihanaGBK.ini (UTF-8)
+          Install: Put version.dll and ChihanaGBK.ini beside the game's Start.exe.
+          EOF
+
+          test -s "$OUTPUT_DIR/version.dll"
+          test -s "$OUTPUT_DIR/ChihanaGBK.ini"
+          echo "Packaged files:"
+          ls -lh "$OUTPUT_DIR"
+
+      - name: Upload DLL artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ChihanaGBK-version-dll-x86
+          path: artifacts/ChihanaGBK-x86/
+          if-no-files-found: error
+          compression-level: 6
