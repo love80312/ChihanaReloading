@@ -1,13 +1,19 @@
-/* chihana_gbk.c -- version.dll 代理 DLL：依 CodePage 支援 Kaguya GBK／Big5 顯示
+/* chihana_gbk.c -- version.dll 代理 DLL：讓 Kaguya 遊戲在簡中區域(ACP 936)下正確顯示指定 GBK 欄位
  *
- * ChihanaGBK v2.4.1.7
+ * ChihanaGBK v2.4.1.8
  *
- * 保留 v2.4.1.6 的既有初始化、Debug Log、IAT Hook、FLS、ReaderWrap、
- * 五個 params 欄位掃描與字型 Hook。此版只把 ReaderWrap 內的目標碼頁
- * 及對應括號／空白位元組改為由 INI 的 CodePage=936／950 選擇。
+ * 本版本以 v2.4.1.6 的 GBK 專用程式碼為基礎：
+ *   1. 固定 ReaderWrap 內 CP936、外部 CP932，不提供 Big5 950 切換。
+ *   2. 保留 UTF-8 Debug Log、PID / TID、LastError 保護。
+ *   3. 保留五個 params ReaderWrap、FLS、GBK 標點及全形空白修補、字型 Hook。
  *
- * 一般 ReaderWrap 外的日文文字仍使用 CP932；message.dat 必須先由
- * Kaguya_YaneKit 轉成指定碼頁，DLL 不會重新編碼 message.dat。
+ * 不更動：
+ *   EncodingEnabled 的開關行為
+ *   CP932 / CP936 轉換選擇
+ *   五個 params ReaderWrap
+ *   FLS
+ *   GBK 標點及全形空白修補
+ *   字型 Hook
  */
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0600
@@ -31,7 +37,6 @@ static int  g_weight = 0;
 static int  g_hscale = 100;
 static int  g_debug = 0;
 static int  g_encoding_enabled = 1;
-static UINT g_codepage = 936;
 static char g_logpath[MAX_PATH];
 
 #define READER_MAX_DEPTH 128
@@ -46,22 +51,8 @@ static DWORD g_readerFls = FLS_OUT_OF_INDEXES;
 __attribute__((used))
 volatile DWORD g_realReader = 0;
 
-
 /* ---------------- UTF-8 Log ---------------- */
 
-/*
- * 所有 Log 統一使用 UTF-8。
- *
- * 新檔案：
- *   寫入 UTF-8 BOM
- *
- * 每行：
- *   [PID=xxxxx TID=xxxxx] 訊息
- *
- * 注意：
- *   舊版 ChihanaGBK.log 可能混有舊編碼內容。
- *   第一次使用 v2.4.1.6 前，請先刪除舊 Log。
- */
 static void logf_(const char *fmt, ...) {
     if (!g_debug) return;
 
@@ -122,15 +113,9 @@ static void logf_(const char *fmt, ...) {
     fclose(f);
 }
 
-
 /*
  * 將 ANSI 字串轉成 UTF-8。
- *
- * 優先使用目前執行緒 ANSI Code Page，
- * 再以系統 ANSI Code Page 嘗試。
- *
- * 使用 flags=0，避免一般舊式 ANSI Code Page
- * 不支援 MB_ERR_INVALID_CHARS 而轉換失敗。
+ * 優先使用目前執行緒 ANSI Code Page，再嘗試系統 ANSI Code Page。
  */
 static BOOL ansi_to_utf8(
     const char *src,
@@ -223,7 +208,6 @@ static BOOL ansi_to_utf8(
     return FALSE;
 }
 
-
 /* ---------------- 真正的 version.dll 轉接 ---------------- */
 
 static HMODULE g_realVer;
@@ -246,7 +230,6 @@ static PFN_VQV p_VQV;
 
 static BOOL ensure_initialized(void);
 
-
 __declspec(dllexport)
 BOOL WINAPI GetFileVersionInfoA(
     LPCSTR a,
@@ -266,7 +249,6 @@ BOOL WINAPI GetFileVersionInfoA(
     return p_GFVI ? p_GFVI(a, b, c, d) : FALSE;
 }
 
-
 __declspec(dllexport)
 DWORD WINAPI GetFileVersionInfoSizeA(
     LPCSTR a,
@@ -283,7 +265,6 @@ DWORD WINAPI GetFileVersionInfoSizeA(
 
     return p_GFVIS ? p_GFVIS(a, b) : 0;
 }
-
 
 __declspec(dllexport)
 BOOL WINAPI VerQueryValueA(
@@ -303,7 +284,6 @@ BOOL WINAPI VerQueryValueA(
 
     return p_VQV ? p_VQV(a, b, c, d) : FALSE;
 }
-
 
 static void load_real_version(void) {
     char p[MAX_PATH];
@@ -339,7 +319,6 @@ static void load_real_version(void) {
         "VerQueryValueA"
     );
 }
-
 
 /* ---------------- IAT 修補 ---------------- */
 
@@ -434,7 +413,6 @@ static BOOL patch_iat(
     return FALSE;
 }
 
-
 /* ---------------- HEX Log ---------------- */
 
 static void hex_(
@@ -455,7 +433,6 @@ static void hex_(
 
     dst[o] = 0;
 }
-
 
 /* ---------------- hooks ---------------- */
 
@@ -482,7 +459,6 @@ static PFN_CFIA real_CFIA;
 static PFN_WCTMB real_WCTMB;
 static PFN_LLA real_LLA;
 
-
 /* ---------------- 字型 Hook ---------------- */
 
 static HFONT WINAPI My_CFIA(
@@ -498,7 +474,7 @@ static HFONT WINAPI My_CFIA(
      * 保留遊戲原始 lfCharSet，只替換字型名稱。
      *
      * EncodingEnabled=1：
-     * 使用依 CodePage 自動對應的字型 Charset。
+     * 使用 INI Charset。
      */
     if (g_encoding_enabled)
         lf.lfCharSet = (BYTE)g_charset;
@@ -529,14 +505,12 @@ static HFONT WINAPI My_CFIA(
     return real_CFIA(&lf);
 }
 
-
 /* ---------------- FLS 狀態 ---------------- */
 
 static VOID CALLBACK reader_state_cleanup(PVOID data) {
     if (data)
         HeapFree(GetProcessHeap(), 0, data);
 }
-
 
 static ReaderThreadState *reader_state_get(BOOL create) {
     if (g_readerFls == FLS_OUT_OF_INDEXES)
@@ -567,7 +541,6 @@ static ReaderThreadState *reader_state_get(BOOL create) {
     return state;
 }
 
-
 static BOOL reader_active(void) {
     DWORD saved = GetLastError();
 
@@ -581,7 +554,6 @@ static BOOL reader_active(void) {
 
     return active;
 }
-
 
 /* 由 ReaderWrap 組語呼叫。 */
 
@@ -606,7 +578,6 @@ reader_enter(DWORD return_address) {
     return ok;
 }
 
-
 /* 由 ReaderWrap 組語呼叫。 */
 
 DWORD __attribute__((noinline, used))
@@ -627,7 +598,6 @@ reader_leave(void) {
     return return_address;
 }
 
-
 /* ---------------- WideCharToMultiByte Hook ---------------- */
 
 static int WINAPI My_WCTMB(
@@ -645,12 +615,11 @@ static int WINAPI My_WCTMB(
     BOOL in_reader = reader_active();
 
     /*
-     * ReaderWrap 內五個 params 欄位使用 INI 指定的目標碼頁；
-     * ReaderWrap 外的一般日文文字維持 CP932。
-     * message.dat 由 Kaguya_YaneKit 預先轉碼，DLL 不處理該檔案。
+     * ReaderWrap 範圍內固定 CP936。
+     * ReaderWrap 範圍外維持 CP932。
      */
     if (cp == CP_THREAD_ACP)
-        cp = in_reader ? g_codepage : 932;
+        cp = in_reader ? 936 : 932;
 
     int r = real_WCTMB(
         cp,
@@ -663,9 +632,6 @@ static int WINAPI My_WCTMB(
         ud
     );
 
-    /*
-     * 必須在任何 Debug 操作前取得 API 的錯誤碼。
-     */
     DWORD api_error = GetLastError();
 
     if (g_debug >= 2 && in_reader && ws) {
@@ -747,7 +713,6 @@ static int WINAPI My_WCTMB(
     return r;
 }
 
-
 /* ---------------- 視窗標題追蹤 ---------------- */
 
 typedef HWND (WINAPI *PFN_CWEA)(
@@ -772,7 +737,6 @@ typedef BOOL (WINAPI *PFN_SWTA)(
 
 static PFN_CWEA real_CWEA;
 static PFN_SWTA real_SWTA;
-
 
 static void log_title_(
     const char *api,
@@ -799,7 +763,6 @@ static void log_title_(
         h
     );
 }
-
 
 static HWND WINAPI My_CWEA(
     DWORD ex,
@@ -834,7 +797,6 @@ static HWND WINAPI My_CWEA(
     );
 }
 
-
 static BOOL WINAPI My_SWTA(
     HWND h,
     LPCSTR t
@@ -844,7 +806,6 @@ static BOOL WINAPI My_SWTA(
 
     return real_SWTA(h, t);
 }
-
 
 /* ---------------- 動態模組字型 Hook ---------------- */
 
@@ -857,14 +818,10 @@ static void hook_module_fonts(HMODULE m) {
     );
 }
 
-
 static HMODULE WINAPI My_LLA(LPCSTR name) {
 
     HMODULE h = real_LLA(name);
 
-    /*
-     * 先保存真正 LoadLibraryA 的 LastError。
-     */
     DWORD api_error = GetLastError();
 
     if (h) {
@@ -888,10 +845,6 @@ static HMODULE WINAPI My_LLA(LPCSTR name) {
 
             } else {
 
-                /*
-                 * 轉換失敗時保留原始位元組 HEX，
-                 * 不將非 UTF-8 ANSI 路徑直接寫入 UTF-8 Log。
-                 */
                 char raw[256];
 
                 int raw_len = lstrlenA(name);
@@ -919,27 +872,12 @@ static HMODULE WINAPI My_LLA(LPCSTR name) {
         }
     }
 
-    /*
-     * 字型 IAT 修補及 Debug 寫檔不得改變
-     * 原始 LoadLibraryA 的 LastError。
-     */
     SetLastError(api_error);
 
     return h;
 }
 
-
 /* ---------------- ReaderWrap ---------------- */
-
-/*
- * params string16 reader 的包裝。
- *
- * 原返回位址以參數交給 reader_enter，
- * 存放在執行緒專屬 FLS 堆疊。
- *
- * FLS 配置失敗或巢狀深度超過上限時，
- * 直接 tail-jump 原 reader。
- */
 
 __asm__(
     ".text\n.globl _ReaderWrap\n_ReaderWrap:\n"
@@ -991,7 +929,6 @@ __asm__(
 
 extern void ReaderWrap(void);
 
-
 /* ---------------- Reader 呼叫點修補 ---------------- */
 
 static BOOL patch_reader_site(DWORD va) {
@@ -1031,8 +968,7 @@ static BOOL patch_reader_site(DWORD va) {
     return TRUE;
 }
 
-
-/* ---------------- 目標碼頁位元組修補 ---------------- */
+/* ---------------- GBK 位元組修補 ---------------- */
 
 static BOOL patch_bytes(
     DWORD va,
@@ -1062,7 +998,6 @@ static BOOL patch_bytes(
 
     return TRUE;
 }
-
 
 /* ---------------- INI ---------------- */
 
@@ -1119,23 +1054,13 @@ static void read_ini(void) {
         ini
     );
 
-    g_codepage = (UINT)GetPrivateProfileIntA(
-        "Options",
-        "CodePage",
-        936,
-        ini
-    );
-
-    if (g_codepage != 936 && g_codepage != 950) {
-        logf_(
-            "WARNING: unsupported CodePage=%u; fallback to 936",
-            (unsigned)g_codepage
+    g_charset =
+        GetPrivateProfileIntA(
+            "Font",
+            "Charset",
+            134,
+            ini
         );
-        g_codepage = 936;
-    }
-
-    /* LOGFONT charset 由目標碼頁自動對應，不再獨立設定。 */
-    g_charset = (g_codepage == 950) ? 136 : 134;
 
     g_weight =
         GetPrivateProfileIntA(
@@ -1157,16 +1082,12 @@ static void read_ini(void) {
         g_hscale = 100;
 }
 
-
 /* ---------------- 初始化 ---------------- */
 
 static void init(void) {
 
     read_ini();
 
-    /*
-     * Face 轉成 UTF-8 後才寫入 Log。
-     */
     char face_utf8[LF_FACESIZE * 4];
 
     if (!ansi_to_utf8(
@@ -1183,12 +1104,11 @@ static void init(void) {
     }
 
     logf_(
-        "== ChihanaGBK %s (%s) init, exe base %p, encoding=%s, codepage=%u, face=%s charset=%d weight=%d hscale=%d",
+        "== ChihanaGBK %s (%s) init, exe base %p, encoding=%s, face=%s charset=%d weight=%d hscale=%d",
         CHIHANA_VER_STR,
         CHIHANA_BUILD_DATE,
         GetModuleHandleA(NULL),
         g_encoding_enabled ? "ON" : "OFF",
-        (unsigned)g_codepage,
         face_utf8,
         g_charset,
         g_weight,
@@ -1252,14 +1172,11 @@ static void init(void) {
             : 0
     );
 
-
     if (!g_encoding_enabled) {
-
         logf_(
             "EncodingEnabled=0: original text behavior; no encoding or text-trace hooks; font hooks remain enabled"
         );
     }
-
 
     /* ---------------- Debug 視窗標題追蹤 ---------------- */
 
@@ -1303,17 +1220,10 @@ static void init(void) {
         );
     }
 
-
-    /* ---------------- 目標碼頁編碼模式（GBK／Big5） ---------------- */
+    /* ---------------- GBK 編碼模式 ---------------- */
 
     if (g_encoding_enabled) {
 
-        /*
-         * params 讀取點 / 標點：
-         * 自動掃描 exe 映像。
-         *
-         * kaguya_scan.h 不修改。
-         */
         KScan sc;
 
         int found = ks_scan(
@@ -1336,9 +1246,7 @@ static void init(void) {
 
             if (g_readerFls != FLS_OUT_OF_INDEXES) {
 
-                /*
-                 * 保留五個自動 params 欄位。
-                 */
+                /* 保留五個自動 params 欄位。 */
                 for (int i = 0; i < 5; i++) {
                     if (sc.site[i]) {
                         ok += patch_reader_site(
@@ -1354,37 +1262,25 @@ static void init(void) {
                 );
             }
 
-
-            /* 】：GBK A1 BF；Big5 A1 6A */
+            /* 】 */
             static const BYTE e1[] = {
                 0x81, 0x7A
             };
-            static const BYTE r1_gbk[] = {
+
+            static const BYTE r1[] = {
                 0xA1, 0xBF
             };
-            static const BYTE r1_big5[] = {
-                0xA1, 0x6A
-            };
-            const BYTE *r1 =
-                (g_codepage == 950) ? r1_big5 : r1_gbk;
 
-
-            /* 【：GBK A1 BE；Big5 A1 69 */
+            /* 【 */
             static const BYTE e2[] = {
                 0x81, 0x79
             };
-            static const BYTE r2_gbk[] = {
+
+            static const BYTE r2[] = {
                 0xA1, 0xBE
             };
-            static const BYTE r2_big5[] = {
-                0xA1, 0x69
-            };
-            const BYTE *r2 =
-                (g_codepage == 950) ? r2_big5 : r2_gbk;
-
 
             for (int i = 0; i < sc.n_close; i++) {
-
                 br += patch_bytes(
                     (DWORD)exe + sc.br_close[i],
                     e1,
@@ -1393,9 +1289,7 @@ static void init(void) {
                 );
             }
 
-
             for (int i = 0; i < sc.n_open; i++) {
-
                 br += patch_bytes(
                     (DWORD)exe + sc.br_open[i],
                     e2,
@@ -1404,37 +1298,25 @@ static void init(void) {
                 );
             }
 
-
-            /* 全形空白：GBK A1 A1；Big5 A1 40 */
+            /* 全形空白 */
             static const BYTE e3[] = {
                 0x81, 0x40
             };
-            static const BYTE r3_gbk[] = {
+
+            static const BYTE r3[] = {
                 0xA1, 0xA1
             };
-            static const BYTE r3_big5[] = {
-                0xA1, 0x40
-            };
-            const BYTE *r3 =
-                (g_codepage == 950) ? r3_big5 : r3_gbk;
-
 
             /* 半形空白 + 全形空白 */
             static const BYTE e4[] = {
                 0x20, 0x81, 0x40
             };
-            static const BYTE r4_gbk[] = {
+
+            static const BYTE r4[] = {
                 0x20, 0xA1, 0xA1
             };
-            static const BYTE r4_big5[] = {
-                0x20, 0xA1, 0x40
-            };
-            const BYTE *r4 =
-                (g_codepage == 950) ? r4_big5 : r4_gbk;
-
 
             for (int i = 0; i < sc.n_sp1; i++) {
-
                 br += patch_bytes(
                     (DWORD)exe + sc.sp1[i],
                     e3,
@@ -1443,9 +1325,7 @@ static void init(void) {
                 );
             }
 
-
             for (int i = 0; i < sc.n_sp2; i++) {
-
                 br += patch_bytes(
                     (DWORD)exe + sc.sp2[i],
                     e4,
@@ -1454,14 +1334,12 @@ static void init(void) {
                 );
             }
 
-
             logf_(
-                "掃描成功: reader=%p (呼叫者 %d), 欄位 %d/5, ReaderWrap CP%u 欄位 %d/5, FLS=%s, 】【 %d+%d, 全形空白 %d+%d",
+                "掃描成功: reader=%p (呼叫者 %d), 欄位 %d/5, ReaderWrap CP936 欄位 %d/5, FLS=%s, 】【 %d+%d, 全形空白 %d+%d",
 
                 (void *)g_realReader,
                 sc.reader_callers,
                 sc.nsite,
-                (unsigned)g_codepage,
                 ok,
 
                 g_readerFls != FLS_OUT_OF_INDEXES
@@ -1481,10 +1359,7 @@ static void init(void) {
             );
         }
 
-
-        /*
-         * ExtraSites
-         */
+        /* ExtraSites */
         if (
             found &&
             g_readerFls != FLS_OUT_OF_INDEXES
@@ -1526,17 +1401,14 @@ static void init(void) {
                 t;
                 t = strtok(NULL, ", ")
             ) {
-
                 extra += patch_reader_site(
                     (DWORD)strtoul(t, NULL, 0)
                 );
             }
         }
 
-
         logf_(
-            "params CP%u hook: 五個自動欄位=%d/5；ExtraSites=%d；標點(】【全形空白): %d 處",
-            (unsigned)g_codepage,
+            "params CP936 hook: 五個自動欄位=%d/5；ExtraSites=%d；標點(】【全形空白): %d 處",
             ok,
             extra,
             br
@@ -1544,23 +1416,16 @@ static void init(void) {
 
     } else {
 
-        /*
-         * 原版文字模式：
-         * 不掃描、不掛 ReaderWrap、不套用 ExtraSites，
-         * 也不修改目標碼頁文字位元組。
-         */
         logf_(
-            "EncodingEnabled=0: skipped text conversion hook, params scan, ReaderWrap/ExtraSites and target-codepage byte patches; font hooks remain enabled"
+            "EncodingEnabled=0: skipped text conversion hook, params scan, ReaderWrap/ExtraSites and GBK byte patches; font hooks remain enabled"
         );
     }
 }
-
 
 /* ---------------- InitOnce ---------------- */
 
 static INIT_ONCE g_initOnce =
     INIT_ONCE_STATIC_INIT;
-
 
 static BOOL CALLBACK initialize_once(
     PINIT_ONCE once,
@@ -1578,9 +1443,7 @@ static BOOL CALLBACK initialize_once(
     return TRUE;
 }
 
-
 static BOOL ensure_initialized(void) {
-
     return InitOnceExecuteOnce(
         &g_initOnce,
         initialize_once,
@@ -1588,7 +1451,6 @@ static BOOL ensure_initialized(void) {
         NULL
     );
 }
-
 
 /* ---------------- DllMain ---------------- */
 

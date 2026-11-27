@@ -1,55 +1,72 @@
-# ChihanaGBK v2.4.1.5
+# ChihanaGBK v2.4.1.8
 
-`version.dll` 代理 DLL，供 Kaguya 引擎遊戲使用。以已測試可讀取 Kaguya 5.7／5.8 的 v2.4.1.1（commit `ed433f6`）為基礎，新增可獨立控制編碼介入的 `EncodingEnabled` 開關。
+Kaguya 引擎用 x86 `version.dll` 代理 DLL。
 
-## 編碼與字型開關
+本版以 v2.4.1.6 的 GBK 專用程式碼為基礎，固定使用 CP936，不提供 Big5 950 或 CodePage 切換。
 
-`ChihanaGBK.ini` 的 `[Options]` 區塊提供 `EncodingEnabled`：
+## 編碼行為
 
-- `EncodingEnabled=1`：正常 ChihanaGBK 模式。維持一般文字 `CP_THREAD_ACP` 轉為 CP932、進入五個 params ReaderWrap 欄位時使用 CP936，並保留 `ExtraSites`、GBK 標點 `】【` 與全形空白修補。
-- `EncodingEnabled=0`：原版文字模式。不安裝 `WideCharToMultiByte` 編碼掛鉤、不掃描 params、不掛 ReaderWrap、不執行 `ExtraSites`，也不修改 GBK 標點或全形空白位元組。文字解碼完全交由遊戲原本的處理流程；DLL 只替換字型名稱，並保留遊戲原本的 `lfCharSet`。
+- ReaderWrap 範圍內的五個 params 欄位使用 CP936（GBK）。
+- ReaderWrap 範圍外的一般文字維持 CP932。
+- `params.dat` 保持原始日文資料；DLL 僅在執行時轉換五個指定欄位。
+- `message.dat` 的匯入與回存編碼由 Kaguya_YaneKit 工具負責；DLL 不直接重新編碼該檔案。
+- `】【`、全形空白與半形加全形空白保留 GBK 位元組修補。
+- 不使用 `[Options] CodePage`；文字轉碼頁固定為 CP936。
 
-字型名稱 `Face`、粗細 `Weight`、高度 `HeightScale` 在兩種模式均可設定。`Charset` 則有特別規則：只有 `EncodingEnabled=1` 時才會覆寫遊戲字集；`EncodingEnabled=0` 時保留遊戲原本的 `lfCharSet`，忽略 INI 的 `Charset`。例如只替換日文原版遊戲字型：
+## INI 設定
+
+`ChihanaGBK.ini` 與遊戲執行檔、`version.dll` 放在同一資料夾。
 
 ```ini
 [Options]
-EncodingEnabled=0
+EncodingEnabled=1
+Debug=0
 
 [Font]
-Face=你安裝的字型名稱
-; Charset 在 EncodingEnabled=0 時不套用，保留遊戲原始字集
+Face=LXGW Wenkai TC Medium
+Charset=134
+Weight=0
+HeightScale=100
+
+[Params]
+ExtraSites=
 ```
 
-`Charset` 是 Windows `LOGFONT.lfCharSet` 字型字集代碼，不是文字轉碼頁：`128` = 日文 `SHIFTJIS_CHARSET`、`136` = 繁體中文 `CHINESEBIG5_CHARSET`、`134` = 簡體中文 `GB2312_CHARSET`。只有 `EncodingEnabled=1` 時套用；關閉時不覆寫遊戲原始字集。
 
-## v2.4.1.5 修正
+EncodingEnabled
+- 1：啟用 CP932／CP936 文字處理、五個 params ReaderWrap、ExtraSites 與 GBK 位元組修補。
+- 0：停用文字轉碼、params 掃描、ReaderWrap、ExtraSites 與文字位元組修補，但仍保留字型名稱修改。
+Charset
+Charset=134 是 Windows LOGFONT.lfCharSet 字型字集代碼，不是轉碼頁。
+- 128：日文字集
+- 136：繁體中文字集
+- 134：簡體中文字集
+它只控制字型字集；文字轉碼目標固定為 CP936。
+保留功能
+本版保留：
+- UTF-8 Debug Log
+- PID／TID
+- LastError 保護
+- IAT Hook
+- FLS
+- ReaderWrap
+- 五個 params 欄位掃描
+- ExtraSites
+- GBK 標點與空白修補
+- 字型 Hook
+- 動態模組字型 Hook
+- InitOnce
+- 三個 ANSI 版本 API 匯出
+kaguya_scan.h 不在本次修改範圍。
+WCTMB Log 判讀
+當 WideCharToMultiByte 使用 lpWideCharStrLen=-1 且輸出指標為 NULL 查詢需求長度時，回傳長度包含結尾 NUL。
 
-- 修正 v2.4.1.4 在 `EncodingEnabled=0` 時仍無條件覆寫 `LOGFONT.lfCharSet` 的問題。
-- 關閉編碼時，`My_CFIA` 保留遊戲傳入的原始 `lfCharSet`，仍替換 `lfFaceName`，並保留 `Weight`／`HeightScale` 設定。
-- INI 的 `Charset` 只在 `EncodingEnabled=1` 時生效；關閉模式不必再為日文遊戲手動把 134 改成 128。
+如果後續實際轉換提供的輸出容量比需求少 1 byte，Windows 會回傳 0，並設定錯誤碼 122（ERROR_INSUFFICIENT_BUFFER）。
 
-## 本階段修改
+本版不擅自擴張或替換遊戲提供的緩衝區，也不改變 API 回傳語意。這些 Log 必須配合遊戲實際顯示結果判斷，不能單獨視為 DLL 編碼失敗。
+建置與測試
+目標為 Windows x86 Release。
 
-1. 以 v2.4.1.1（`ed433f6`）為基礎新增 `[Options] EncodingEnabled`，預設為 `1`，避免既有使用者未新增設定時失去原本 ChihanaGBK 功能。
-2. `EncodingEnabled=0` 時不安裝 `WideCharToMultiByte` IAT hook，也不執行 params 掃描、五個 ReaderWrap 呼叫點、`ExtraSites` 或 GBK 標點／全形空白修補。
-3. 字型掛鉤始終啟用：主程式仍掛載 `CreateFontIndirectA`，並透過 `LoadLibraryA` 掛鉤後續載入模組的字型 API。關閉編碼不會關閉字型修改。
-4. `EncodingEnabled=1` 時，原本 v2.4.1.1 的五個 params 欄位、FLS／ReaderWrap 組語、掃描器呼叫、GBK 位元組修補與 `ExtraSites` 邏輯均維持不變。
-5. 不修改 `kaguya_scan.h`、`pxxxx.dat`／`message.dat` 的資料讀取程式、版本 API 匯出或延後初始化流程。
+請使用專案既有 GitHub Actions 工作流程建置，並在目標遊戲實測 params、message、字型及標點顯示。
 
-## 安裝
-
-將編譯後的 `version.dll` 與 `ChihanaGBK.ini` 放在遊戲 `Start.exe` 同一個資料夾。修改 INI 後重新啟動遊戲即可生效。
-
-## 版本相容性與驗證
-
-本版以使用者曾實測可正常讀取 Kaguya 5.7、5.8 的 v2.4.1.1 原始碼為底稿。啟用模式的資料讀取與轉換邏輯應與該版本一致；仍需由 GitHub Actions 編譯後，以 `EncodingEnabled=1` 回歸測試 5.7／5.8，以及以 `EncodingEnabled=0` 確認原版文字流程與自訂字型。靜態檢查不能取代實機驗證。
-
-## 建置
-
-沿用專案既有 Windows x86／MinGW 建置流程。此 DLL 必須編譯為 32 位元 x86，並保留原本三個 ANSI 匯出：
-
-- `GetFileVersionInfoA`
-- `GetFileVersionInfoSizeA`
-- `VerQueryValueA`
-
-`kaguya_scan.h` 未修改，請保留 `_ai_fix` 分支原檔；本 ZIP 不包含該檔，避免不必要地覆蓋掃描器。
+本原始碼尚未經本次 GitHub Actions 編譯及目標遊戲實機測試。
