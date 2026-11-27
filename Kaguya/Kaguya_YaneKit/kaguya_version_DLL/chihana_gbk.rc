@@ -20,7 +20,7 @@ BEGIN
             VALUE "ProductVersion",   CHIHANA_VER_STR
             VALUE "InternalName",     "version.dll"
             VALUE "OriginalFilename", "version.dll"
-            VALUE "Comments",         "版本 " CHIHANA_VER_STR "（" CHIHANA_BUILD_DATE "）。EncodingEnabled=1 時啟用完整 CP932/CP936 編碼與 GBK 修補；設為 0 時文字處理交回遊戲原版，只保留字型 hook。"
+            VALUE "Comments",         "版本 " CHIHANA_VER_STR "（" CHIHANA_BUILD_DATE "）。EncodingEnabled=1 時啟用完整 CP932/CP936 編碼與 GBK 修補；設為 0 時文字處理交回遊戲原版，只替換字型名稱並保留原始 lfCharSet。"
             VALUE "LegalCopyright",   "ChihanaGBK 本地化輔助工具，僅供個人學習與本地化使用"
             VALUE "PrivateBuild",     CHIHANA_BUILD_DATE
         END

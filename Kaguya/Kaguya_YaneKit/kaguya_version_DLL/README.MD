@@ -1,4 +1,4 @@
-# ChihanaGBK v2.4.1.4
+# ChihanaGBK v2.4.1.5
 
 `version.dll` 代理 DLL，供 Kaguya 引擎遊戲使用。以已測試可讀取 Kaguya 5.7／5.8 的 v2.4.1.1（commit `ed433f6`）為基礎，新增可獨立控制編碼介入的 `EncodingEnabled` 開關。
 
@@ -7,9 +7,9 @@
 `ChihanaGBK.ini` 的 `[Options]` 區塊提供 `EncodingEnabled`：
 
 - `EncodingEnabled=1`：正常 ChihanaGBK 模式。維持一般文字 `CP_THREAD_ACP` 轉為 CP932、進入五個 params ReaderWrap 欄位時使用 CP936，並保留 `ExtraSites`、GBK 標點 `】【` 與全形空白修補。
-- `EncodingEnabled=0`：原版文字模式。不安裝 `WideCharToMultiByte` 編碼掛鉤、不掃描 params、不掛 ReaderWrap、不執行 `ExtraSites`，也不修改 GBK 標點或全形空白位元組。文字解碼完全交由遊戲原本的處理流程；DLL 只保留字型掛鉤。
+- `EncodingEnabled=0`：原版文字模式。不安裝 `WideCharToMultiByte` 編碼掛鉤、不掃描 params、不掛 ReaderWrap、不執行 `ExtraSites`，也不修改 GBK 標點或全形空白位元組。文字解碼完全交由遊戲原本的處理流程；DLL 只替換字型名稱，並保留遊戲原本的 `lfCharSet`。
 
-字型設定不受 `EncodingEnabled` 影響。兩種模式都能修改 `Face`、`Charset`、`Weight`、`HeightScale`。例如只替換日文原版遊戲字型：
+字型名稱 `Face`、粗細 `Weight`、高度 `HeightScale` 在兩種模式均可設定。`Charset` 則有特別規則：只有 `EncodingEnabled=1` 時才會覆寫遊戲字集；`EncodingEnabled=0` 時保留遊戲原本的 `lfCharSet`，忽略 INI 的 `Charset`。例如只替換日文原版遊戲字型：
 
 ```ini
 [Options]
@@ -17,10 +17,16 @@ EncodingEnabled=0
 
 [Font]
 Face=你安裝的字型名稱
-Charset=128
+; Charset 在 EncodingEnabled=0 時不套用，保留遊戲原始字集
 ```
 
-`Charset` 是 Windows `LOGFONT.lfCharSet` 字型字集代碼，不是文字轉碼頁：`128` = 日文 `SHIFTJIS_CHARSET`、`136` = 繁體中文 `CHINESEBIG5_CHARSET`、`134` = 簡體中文 `GB2312_CHARSET`。它只指定字型字集，不會令 DLL 強制文字解碼成相應編碼。
+`Charset` 是 Windows `LOGFONT.lfCharSet` 字型字集代碼，不是文字轉碼頁：`128` = 日文 `SHIFTJIS_CHARSET`、`136` = 繁體中文 `CHINESEBIG5_CHARSET`、`134` = 簡體中文 `GB2312_CHARSET`。只有 `EncodingEnabled=1` 時套用；關閉時不覆寫遊戲原始字集。
+
+## v2.4.1.5 修正
+
+- 修正 v2.4.1.4 在 `EncodingEnabled=0` 時仍無條件覆寫 `LOGFONT.lfCharSet` 的問題。
+- 關閉編碼時，`My_CFIA` 保留遊戲傳入的原始 `lfCharSet`，仍替換 `lfFaceName`，並保留 `Weight`／`HeightScale` 設定。
+- INI 的 `Charset` 只在 `EncodingEnabled=1` 時生效；關閉模式不必再為日文遊戲手動把 134 改成 128。
 
 ## 本階段修改
 

@@ -127,7 +127,8 @@ static PFN_CFIA real_CFIA; static PFN_WCTMB real_WCTMB; static PFN_LLA real_LLA;
 static HFONT WINAPI My_CFIA(const LOGFONTA *in) {
     if (!in) return real_CFIA(in);
     LOGFONTA lf = *in;                         /* 不修改呼叫者的結構 */
-    lf.lfCharSet = (BYTE)g_charset;
+    /* 原版文字模式只替換字型名稱，不覆寫遊戲原本的字集；Charset 僅在編碼模式啟用時套用。 */
+    if (g_encoding_enabled) lf.lfCharSet = (BYTE)g_charset;
     if (g_face[0]) { memset(lf.lfFaceName, 0, LF_FACESIZE); lstrcpynA(lf.lfFaceName, g_face, LF_FACESIZE); }
     if (g_weight > 0 && lf.lfWeight < 400) lf.lfWeight = g_weight;
     if (g_hscale != 100) {

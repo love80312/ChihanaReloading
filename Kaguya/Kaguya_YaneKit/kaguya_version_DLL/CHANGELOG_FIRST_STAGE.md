@@ -1,3 +1,22 @@
+# v2.4.1.5 修正紀錄
+
+## 修正原因
+
+- v2.4.1.4 雖然在 `EncodingEnabled=0` 時停用文字編碼掛鉤，但 `My_CFIA()` 仍無條件執行 `lf.lfCharSet = g_charset`。因此 INI 預設 `Charset=134` 仍會覆寫日文遊戲原本的字集，使用者必須手動改成 128。
+
+## 本版修正
+
+- `EncodingEnabled=0` 時不再覆寫 `LOGFONT.lfCharSet`，保留遊戲原本傳入的字集；仍套用 `Face` 字型名稱，以及原有 `Weight`／`HeightScale`。
+- `EncodingEnabled=1` 時維持原本行為，依 INI 的 `Charset` 覆寫字集。
+- 因此關閉模式可保留 INI 的 `Charset=134`，不再需要為日文版改成 128。
+
+## 保留與驗證
+
+- 本次僅增加 `lfCharSet` 的開關條件；不改動 WCTMB、params ReaderWrap、FLS、掃描器、GBK 位元組修補或 `kaguya_scan.h`。
+- 仍須實機確認 `EncodingEnabled=0` 時日文劇本正常、字型名稱替換有效；並確認 `EncodingEnabled=1` 的舊有中文模式回歸正常。
+
+---
+
 # v2.4.1.4 修正紀錄
 
 ## 修正目標
