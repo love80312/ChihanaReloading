@@ -10,27 +10,34 @@ permissions:
 jobs:
   build:
     name: Build ChihanaGBK x86 DLL
+    # 僅允許從 _ai_fix 分支建置，避免誤用其他分支的原始碼。
+    if: github.ref == 'refs/heads/_ai_fix'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     env:
       SOURCE_DIR: Kaguya/Kaguya_YaneKit/kaguya_version_DLL
       BUILD_DIR: build/ChihanaGBK-x86
-      OUTPUT_DIR: artifacts/ChihanaGBK-x86
+      RELEASE_DIR: artifacts/ChihanaGBK-x86
+      DEBUG_DIR: artifacts/ChihanaGBK-x86-debug
 
     steps:
       - name: Checkout DLL source only
         uses: actions/checkout@v7
         with:
-          # 手動執行時，依 Actions 頁面選擇的分支取原始碼。
+          # workflow_dispatch 選擇 _ai_fix 時，使用該分支的原始碼。
           ref: ${{ github.ref }}
           sparse-checkout: |
             /Kaguya/Kaguya_YaneKit/kaguya_version_DLL/
           sparse-checkout-cone-mode: false
           submodules: false
+          # 此工作流程不會執行 git push；停用憑證持久化，避免不必要的清理步驟。
+          persist-credentials: false
 
       - name: Install 32-bit MinGW-w64 cross compiler
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-mingw-w64-i686 \
@@ -44,13 +51,17 @@ jobs:
             chihana_gbk.c \
             chihana_gbk.rc \
             chihana_version.h \
-            kaguya_scan.h; do
+            kaguya_scan.h \
+            README.MD; do
             if [[ ! -f "$SOURCE_DIR/$file" ]]; then
               echo "Missing source file: $SOURCE_DIR/$file" >&2
               exit 1
             fi
           done
-          mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
+
+          mkdir -p "$BUILD_DIR" "$RELEASE_DIR" "$DEBUG_DIR"
+          echo "Source commit: $(git rev-parse HEAD)"
+          echo "Source branch: $GITHUB_REF_NAME"
 
       - name: Compile version resources
         shell: bash
@@ -62,13 +73,15 @@ jobs:
             -O coff \
             -o "$BUILD_DIR/chihana_gbk_res.o"
 
-      - name: Build x86 version.dll
+      - name: Build unstripped x86 version.dll
         shell: bash
         run: |
           set -euo pipefail
+          # 先產生含除錯資訊的母檔，再由下一步複製並剝除正式版符號。
           i686-w64-mingw32-gcc \
             -std=gnu11 \
             -O2 \
+            -g \
             -Wall \
             -Wextra \
             -Wno-deprecated-declarations \
@@ -78,53 +91,32 @@ jobs:
             -Wl,--enable-stdcall-fixup \
             -Wl,--no-undefined \
             -Wl,--subsystem,windows \
-            -o "$OUTPUT_DIR/version.dll" \
+            -o "$BUILD_DIR/version.dll" \
             "$SOURCE_DIR/chihana_gbk.c" \
             "$BUILD_DIR/chihana_gbk_res.o" \
             -lkernel32 \
             -luser32 \
             -lgdi32
 
-      - name: Verify DLL architecture and exports
+          test -s "$BUILD_DIR/version.dll"
+
+      - name: Create release and debug DLL packages
         shell: bash
         run: |
           set -euo pipefail
-          DLL="$OUTPUT_DIR/version.dll"
 
-          if [[ ! -s "$DLL" ]]; then
-            echo "version.dll was not generated." >&2
-            exit 1
-          fi
+          # 兩個 Artifact 使用相同檔名，方便直接替換測試。
+          cp "$BUILD_DIR/version.dll" "$DEBUG_DIR/version.dll"
+          cp "$BUILD_DIR/version.dll" "$RELEASE_DIR/version.dll"
 
-          i686-w64-mingw32-objdump -f "$DLL" | tee "$BUILD_DIR/file-info.txt"
-          if ! grep -q "pei-i386" "$BUILD_DIR/file-info.txt"; then
-            echo "The output is not a 32-bit x86 Windows PE file." >&2
-            exit 1
-          fi
+          # 正式版移除符號與除錯資訊；不修改 DLL 原始碼或匯出項目。
+          i686-w64-mingw32-strip --strip-all "$RELEASE_DIR/version.dll"
 
-          i686-w64-mingw32-objdump -p "$DLL" > "$BUILD_DIR/exports.txt"
-          for symbol in \
-            GetFileVersionInfoA \
-            GetFileVersionInfoSizeA \
-            VerQueryValueA; do
-            if ! grep -Fq "$symbol" "$BUILD_DIR/exports.txt"; then
-              echo "Required export not found: $symbol" >&2
-              cat "$BUILD_DIR/exports.txt"
-              exit 1
-            fi
-          done
-
-          echo "DLL architecture and required exports verified."
-
-      - name: Package DLL, INI and build documentation
-        shell: bash
-        run: |
-          set -euo pipefail
-          cp "$SOURCE_DIR/README.MD" "$OUTPUT_DIR/README.MD"
+          cp "$SOURCE_DIR/README.MD" "$RELEASE_DIR/README.MD"
+          cp "$SOURCE_DIR/README.MD" "$DEBUG_DIR/README.MD"
 
           # 遊戲啟動時會從 Start.exe 所在資料夾讀取 ChihanaGBK.ini。
-          # 將預設設定直接放進 Artifact，與 version.dll 一起交付。
-          cat > "$OUTPUT_DIR/ChihanaGBK.ini" <<'INI'
+          cat > "$RELEASE_DIR/ChihanaGBK.ini" <<'INI'
           ; 與 start.exe、version.dll 放在同一個資料夾。
           ; 改完存檔，重新啟動遊戲即生效，不需重新產生檔案。
 
@@ -153,26 +145,106 @@ jobs:
           ; 2 = 另外記錄 params 字串的轉碼前後位元組與視窗標題位元組（排查亂碼/多餘字元用，會寫很多行，查完請改回 0）
           Debug=0
           INI
+          cp "$RELEASE_DIR/ChihanaGBK.ini" "$DEBUG_DIR/ChihanaGBK.ini"
 
-          cat > "$OUTPUT_DIR/BUILD_INFO.txt" <<'EOF'
-          Product: ChihanaGBK version.dll
-          Architecture: Windows x86 (32-bit, Intel 80386)
-          Compiler: MinGW-w64 i686 GCC
-          Version: Defined by chihana_version.h
-          Build type: Independent DLL build; not part of Kaguya_YaneKit.exe
-          Included configuration: ChihanaGBK.ini (UTF-8)
-          Install: Put version.dll and ChihanaGBK.ini beside the game's Start.exe.
-          EOF
+          {
+            echo "Product: ChihanaGBK version.dll"
+            echo "Architecture: Windows x86 (32-bit, Intel 80386)"
+            echo "Compiler: MinGW-w64 i686 GCC"
+            echo "Compiler version: $(i686-w64-mingw32-gcc -dumpfullversion -dumpversion)"
+            echo "Source branch: $GITHUB_REF_NAME"
+            echo "Source commit: $(git rev-parse HEAD)"
+            echo "Build UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Build type: Release (all symbols stripped)"
+            echo "Included configuration: ChihanaGBK.ini (UTF-8)"
+            echo "Install: Put version.dll and ChihanaGBK.ini beside the game's Start.exe."
+            echo "DLL size: $(stat -c%s "$RELEASE_DIR/version.dll") bytes"
+            echo "SHA-256:"
+            sha256sum "$RELEASE_DIR/version.dll"
+          } > "$RELEASE_DIR/BUILD_INFO.txt"
 
-          test -s "$OUTPUT_DIR/version.dll"
-          test -s "$OUTPUT_DIR/ChihanaGBK.ini"
-          echo "Packaged files:"
-          ls -lh "$OUTPUT_DIR"
+          {
+            echo "Product: ChihanaGBK version.dll"
+            echo "Architecture: Windows x86 (32-bit, Intel 80386)"
+            echo "Compiler: MinGW-w64 i686 GCC"
+            echo "Compiler version: $(i686-w64-mingw32-gcc -dumpfullversion -dumpversion)"
+            echo "Source branch: $GITHUB_REF_NAME"
+            echo "Source commit: $(git rev-parse HEAD)"
+            echo "Build UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Build type: Debug (unstripped; includes debug symbols)"
+            echo "Included configuration: ChihanaGBK.ini (UTF-8)"
+            echo "Install: Put version.dll and ChihanaGBK.ini beside the game's Start.exe."
+            echo "DLL size: $(stat -c%s "$DEBUG_DIR/version.dll") bytes"
+            echo "SHA-256:"
+            sha256sum "$DEBUG_DIR/version.dll"
+          } > "$DEBUG_DIR/BUILD_INFO.txt"
 
-      - name: Upload DLL artifact
+          echo "Release package:"
+          ls -lh "$RELEASE_DIR"
+          echo "Debug package:"
+          ls -lh "$DEBUG_DIR"
+
+      - name: Verify architecture, exports and debug symbols
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for dll in "$RELEASE_DIR/version.dll" "$DEBUG_DIR/version.dll"; do
+            if [[ ! -s "$dll" ]]; then
+              echo "DLL was not generated: $dll" >&2
+              exit 1
+            fi
+
+            info="$BUILD_DIR/$(basename "$(dirname "$dll")").exports.txt"
+            i686-w64-mingw32-objdump -f "$dll" > "$info"
+            if ! grep -q "pei-i386" "$info"; then
+              echo "The output is not a 32-bit x86 Windows PE file: $dll" >&2
+              cat "$info"
+              exit 1
+            fi
+
+            i686-w64-mingw32-objdump -p "$dll" > "$info"
+            for symbol in \
+              GetFileVersionInfoA \
+              GetFileVersionInfoSizeA \
+              VerQueryValueA; do
+              if ! grep -Fq "$symbol" "$info"; then
+                echo "Required export not found in $dll: $symbol" >&2
+                cat "$info"
+                exit 1
+              fi
+            done
+          done
+
+          i686-w64-mingw32-objdump -h "$DEBUG_DIR/version.dll" > "$BUILD_DIR/debug-sections.txt"
+          if ! grep -q "\.debug_info" "$BUILD_DIR/debug-sections.txt"; then
+            echo "Debug DLL is missing .debug_info." >&2
+            cat "$BUILD_DIR/debug-sections.txt"
+            exit 1
+          fi
+
+          i686-w64-mingw32-objdump -h "$RELEASE_DIR/version.dll" > "$BUILD_DIR/release-sections.txt"
+          if grep -q "\.debug_info" "$BUILD_DIR/release-sections.txt"; then
+            echo "Release DLL still contains .debug_info after stripping." >&2
+            cat "$BUILD_DIR/release-sections.txt"
+            exit 1
+          fi
+
+          echo "PASS: both DLLs are x86 and expose the required ANSI exports."
+          echo "PASS: debug DLL retains symbols; release DLL is stripped."
+
+      - name: Upload release DLL artifact
         uses: actions/upload-artifact@v7
         with:
           name: ChihanaGBK-version-dll-x86
           path: artifacts/ChihanaGBK-x86/
+          if-no-files-found: error
+          compression-level: 6
+
+      - name: Upload debug DLL artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ChihanaGBK-version-dll-x86-debug
+          path: artifacts/ChihanaGBK-x86-debug/
           if-no-files-found: error
           compression-level: 6
