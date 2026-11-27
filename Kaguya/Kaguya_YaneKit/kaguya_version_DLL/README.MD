@@ -1,15 +1,30 @@
-轉接系統 version.dll，並在記憶體中修補 Kaguya 引擎遊戲，使其在簡中區域（Locale Emulator 轉簡中）下正確顯示 GBK 文字，不修改 exe 檔案。
+# ChihanaGBK v2.4.1.0
 
-功能：
-1) 字型強制 GBK 字元集，字型名稱/粗細/字高可由 ChihanaGBK.ini 調整（含 Lib\\Graphics.dll）；
-2) params.dat 的標題、品牌、預設姓名走 GBK(936)，資源名維持 Shift-JIS(932)；
-3) 】【與全形空白改為 GBK 碼（修正視窗標題中間的亂字）。
-載入時自動掃描修補位址。
+`version.dll` 代理 DLL，供 Kaguya 引擎遊戲在簡中區域（Locale Emulator 轉簡中）下顯示指定 GBK 文字；不修改原版 EXE。
 
-已驗證遊戲：A000（params v5.8）、B000/4328（v5.7）、h000/Hakoniwa（v5.8 新編譯器）。
+## 本階段修改
 
-需要 日版exe 匯入 VERSION.dll。
+1. `DllMain` 僅執行 `DisableThreadLibraryCalls`。系統 `version.dll` 載入、INI 讀取、IAT 修補及 EXE 掃描延後到第一次呼叫代理版本 API 時，並由 `InitOnceExecuteOnce` 保證只初始化一次。
+2. ReaderWrap 不再使用跨執行緒共用的返回位址與全域深度。每次呼叫的返回位址改存於該執行緒的 FLS 堆疊，支援多執行緒及巢狀呼叫；FLS 狀態以執行緒結束 callback 回收。
+3. 自動 CP936(GBK) 只套用 `DefaultFirst`、`DefaultSecond` 兩個預設姓名欄位。`GameTitle`、`DisplayTitle`、`Brand` 不再自動切換 CP936；一般資源字串仍維持 ACP 932。
+4. 保留原有字型 hook、標點 `】【` 修補、全形空白修補、Debug 記錄，以及空白預設的 `ExtraSites` 進階手動設定。
 
-# 使用方法：
-## 將 version.dll 和 ChihanaGBK.ini 放在遊戲 Start.exe 同一個資料夾即可。
-### 依照需求修改 `ini`
+## 安裝
+
+將編譯後的 `version.dll` 與 `ChihanaGBK.ini` 放在遊戲 `Start.exe` 同一個資料夾。依需求修改 INI 後重新啟動遊戲。
+
+## 版本相容性
+
+本次沒有修改 `kaguya_scan.h` 的掃描簽章、Reader 定位及欄位辨識邏輯，也沒有修改 `pxxxx.dat` / `message.dat` 的讀取程式。已知基準是使用者已實測可正常讀取 Kaguya 5.7、5.8 的 Claude v2.4 版本；本次變更仍須以新編譯 DLL 在相同遊戲樣本重新回歸測試，不能僅憑靜態檢查宣稱已完成 5.7 / 5.8 實機驗證。
+
+## 建置
+
+沿用專案既有 Windows x86 / MinGW 建置流程。此 DLL 必須編譯為 32 位元 x86，並保留原本三個 ANSI 匯出：
+
+- `GetFileVersionInfoA`
+- `GetFileVersionInfoSizeA`
+- `VerQueryValueA`
+
+`kaguya_scan.h` 未修改，請沿用分支中的原檔。
+
+本次提供的替換檔不包含 `kaguya_scan.h`。請保留 `_ai_fix` 分支原檔，不要以其他版本覆蓋。
