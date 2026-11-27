@@ -10,29 +10,48 @@ permissions:
 jobs:
   build:
     name: Build ChihanaGBK x86 DLL
-    # 僅允許從 _ai_fix 分支建置，避免誤用其他分支的原始碼。
-    if: github.ref == 'refs/heads/_ai_fix'
+    # 手動執行時必須選擇 _ai_fix 分支。
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/_ai_fix'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     env:
-      SOURCE_DIR: Kaguya/Kaguya_YaneKit/kaguya_version_DLL
+      CHECKOUT_DIR: _source
+      SOURCE_DIR: _source/Kaguya/Kaguya_YaneKit/kaguya_version_DLL
       BUILD_DIR: build/ChihanaGBK-x86
       RELEASE_DIR: artifacts/ChihanaGBK-x86
       DEBUG_DIR: artifacts/ChihanaGBK-x86-debug
 
     steps:
-      - name: Checkout DLL source only
-        uses: actions/checkout@v7
-        with:
-          # workflow_dispatch 選擇 _ai_fix 時，使用該分支的原始碼。
-          ref: ${{ github.ref }}
-          sparse-checkout: |
-            /Kaguya/Kaguya_YaneKit/kaguya_version_DLL/
-          sparse-checkout-cone-mode: false
-          submodules: false
-          # 此工作流程不會執行 git push；停用憑證持久化，避免不必要的清理步驟。
-          persist-credentials: false
+      # 不使用 actions/checkout：目前 repo 有 FreeMote gitlink，但沒有 .gitmodules URL，
+      # checkout action 的 auth-cleanup 會因此在 submodule foreach 階段失敗。
+      # 以一般 git fetch + sparse checkout 只取 DLL 原始碼，且不初始化任何 submodule。
+      - name: Fetch DLL source without submodules
+        shell: bash
+        env:
+          SOURCE_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$CHECKOUT_DIR"
+          git -C "$CHECKOUT_DIR" init
+          git -C "$CHECKOUT_DIR" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C "$CHECKOUT_DIR" -c protocol.version=2 fetch \
+            --depth=1 \
+            --no-tags \
+            --no-recurse-submodules \
+            --filter=blob:none \
+            origin "$SOURCE_REF"
+
+          git -C "$CHECKOUT_DIR" config core.sparseCheckout true
+          git -C "$CHECKOUT_DIR" config core.sparseCheckoutCone false
+          printf '/Kaguya/Kaguya_YaneKit/kaguya_version_DLL/\n' \
+            > "$CHECKOUT_DIR/.git/info/sparse-checkout"
+          git -C "$CHECKOUT_DIR" checkout --force --detach FETCH_HEAD
+
+          SOURCE_COMMIT="$(git -C "$CHECKOUT_DIR" rev-parse HEAD)"
+          echo "CHIHANA_SOURCE_COMMIT=$SOURCE_COMMIT" >> "$GITHUB_ENV"
+          echo "Checked out ref: $SOURCE_REF"
+          echo "Source commit: $SOURCE_COMMIT"
 
       - name: Install 32-bit MinGW-w64 cross compiler
         shell: bash
@@ -60,7 +79,7 @@ jobs:
           done
 
           mkdir -p "$BUILD_DIR" "$RELEASE_DIR" "$DEBUG_DIR"
-          echo "Source commit: $(git rev-parse HEAD)"
+          echo "Verified source commit: $CHIHANA_SOURCE_COMMIT"
           echo "Source branch: $GITHUB_REF_NAME"
 
       - name: Compile version resources
@@ -77,7 +96,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # 先產生含除錯資訊的母檔，再由下一步複製並剝除正式版符號。
+          # 先產生含除錯資訊的母檔，再複製成正式版並剝除正式版符號。
           i686-w64-mingw32-gcc \
             -std=gnu11 \
             -O2 \
@@ -153,7 +172,7 @@ jobs:
             echo "Compiler: MinGW-w64 i686 GCC"
             echo "Compiler version: $(i686-w64-mingw32-gcc -dumpfullversion -dumpversion)"
             echo "Source branch: $GITHUB_REF_NAME"
-            echo "Source commit: $(git rev-parse HEAD)"
+            echo "Source commit: $CHIHANA_SOURCE_COMMIT"
             echo "Build UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "Build type: Release (all symbols stripped)"
             echo "Included configuration: ChihanaGBK.ini (UTF-8)"
@@ -169,7 +188,7 @@ jobs:
             echo "Compiler: MinGW-w64 i686 GCC"
             echo "Compiler version: $(i686-w64-mingw32-gcc -dumpfullversion -dumpversion)"
             echo "Source branch: $GITHUB_REF_NAME"
-            echo "Source commit: $(git rev-parse HEAD)"
+            echo "Source commit: $CHIHANA_SOURCE_COMMIT"
             echo "Build UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "Build type: Debug (unstripped; includes debug symbols)"
             echo "Included configuration: ChihanaGBK.ini (UTF-8)"
@@ -196,10 +215,10 @@ jobs:
             fi
 
             info="$BUILD_DIR/$(basename "$(dirname "$dll")").exports.txt"
-            i686-w64-mingw32-objdump -f "$dll" > "$info"
-            if ! grep -q "pei-i386" "$info"; then
+            i686-w64-mingw32-objdump -f "$dll" > "$BUILD_DIR/file-info.txt"
+            if ! grep -q "pei-i386" "$BUILD_DIR/file-info.txt"; then
               echo "The output is not a 32-bit x86 Windows PE file: $dll" >&2
-              cat "$info"
+              cat "$BUILD_DIR/file-info.txt"
               exit 1
             fi
 
