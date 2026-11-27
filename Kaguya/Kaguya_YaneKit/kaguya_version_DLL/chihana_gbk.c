@@ -1,22 +1,13 @@
-
-/* chihana_gbk.c -- version.dll 代理 DLL：讓 Kaguya 遊戲在簡中區域(ACP 936)下正確顯示指定 GBK 欄位
+/* chihana_gbk.c -- version.dll 代理 DLL：依 CodePage 支援 Kaguya GBK／Big5 顯示
  *
- * ChihanaGBK v2.4.1.6
+ * ChihanaGBK v2.4.1.7
  *
- * 本版本以已測試成功的 v2.4.1.5 為基礎，只改善 Debug Log：
- *   1. Log 統一使用 UTF-8，新的 Log 檔案寫入 UTF-8 BOM。
- *   2. ANSI 字串轉成 UTF-8，避免 LoadLibraryA 路徑亂碼。
- *   3. 每行加入 PID / TID，辨識不同程序及執行緒。
- *   4. WCTMB 記錄 API 回傳值、GetLastError 及有效輸出長度。
- *   5. Debug 寫檔後恢復原 API 的 LastError。
+ * 保留 v2.4.1.6 的既有初始化、Debug Log、IAT Hook、FLS、ReaderWrap、
+ * 五個 params 欄位掃描與字型 Hook。此版只把 ReaderWrap 內的目標碼頁
+ * 及對應括號／空白位元組改為由 INI 的 CodePage=936／950 選擇。
  *
- * 不更動：
- *   EncodingEnabled 的開關行為
- *   CP932 / CP936 轉換選擇
- *   五個 params ReaderWrap
- *   FLS
- *   GBK 標點及全形空白修補
- *   字型 Hook
+ * 一般 ReaderWrap 外的日文文字仍使用 CP932；message.dat 必須先由
+ * Kaguya_YaneKit 轉成指定碼頁，DLL 不會重新編碼 message.dat。
  */
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0600
@@ -40,6 +31,7 @@ static int  g_weight = 0;
 static int  g_hscale = 100;
 static int  g_debug = 0;
 static int  g_encoding_enabled = 1;
+static UINT g_codepage = 936;
 static char g_logpath[MAX_PATH];
 
 #define READER_MAX_DEPTH 128
@@ -506,7 +498,7 @@ static HFONT WINAPI My_CFIA(
      * 保留遊戲原始 lfCharSet，只替換字型名稱。
      *
      * EncodingEnabled=1：
-     * 使用 INI Charset。
+     * 使用依 CodePage 自動對應的字型 Charset。
      */
     if (g_encoding_enabled)
         lf.lfCharSet = (BYTE)g_charset;
@@ -653,10 +645,12 @@ static int WINAPI My_WCTMB(
     BOOL in_reader = reader_active();
 
     /*
-     * 保留 v2.4.1.5 原有 CP932 / CP936 判斷。
+     * ReaderWrap 內五個 params 欄位使用 INI 指定的目標碼頁；
+     * ReaderWrap 外的一般日文文字維持 CP932。
+     * message.dat 由 Kaguya_YaneKit 預先轉碼，DLL 不處理該檔案。
      */
     if (cp == CP_THREAD_ACP)
-        cp = in_reader ? 936 : 932;
+        cp = in_reader ? g_codepage : 932;
 
     int r = real_WCTMB(
         cp,
@@ -1038,7 +1032,7 @@ static BOOL patch_reader_site(DWORD va) {
 }
 
 
-/* ---------------- GBK 位元組修補 ---------------- */
+/* ---------------- 目標碼頁位元組修補 ---------------- */
 
 static BOOL patch_bytes(
     DWORD va,
@@ -1125,13 +1119,23 @@ static void read_ini(void) {
         ini
     );
 
-    g_charset =
-        GetPrivateProfileIntA(
-            "Font",
-            "Charset",
-            134,
-            ini
+    g_codepage = (UINT)GetPrivateProfileIntA(
+        "Options",
+        "CodePage",
+        936,
+        ini
+    );
+
+    if (g_codepage != 936 && g_codepage != 950) {
+        logf_(
+            "WARNING: unsupported CodePage=%u; fallback to 936",
+            (unsigned)g_codepage
         );
+        g_codepage = 936;
+    }
+
+    /* LOGFONT charset 由目標碼頁自動對應，不再獨立設定。 */
+    g_charset = (g_codepage == 950) ? 136 : 134;
 
     g_weight =
         GetPrivateProfileIntA(
@@ -1179,11 +1183,12 @@ static void init(void) {
     }
 
     logf_(
-        "== ChihanaGBK %s (%s) init, exe base %p, encoding=%s, face=%s charset=%d weight=%d hscale=%d",
+        "== ChihanaGBK %s (%s) init, exe base %p, encoding=%s, codepage=%u, face=%s charset=%d weight=%d hscale=%d",
         CHIHANA_VER_STR,
         CHIHANA_BUILD_DATE,
         GetModuleHandleA(NULL),
         g_encoding_enabled ? "ON" : "OFF",
+        (unsigned)g_codepage,
         face_utf8,
         g_charset,
         g_weight,
@@ -1299,7 +1304,7 @@ static void init(void) {
     }
 
 
-    /* ---------------- GBK 編碼模式 ---------------- */
+    /* ---------------- 目標碼頁編碼模式（GBK／Big5） ---------------- */
 
     if (g_encoding_enabled) {
 
@@ -1350,24 +1355,32 @@ static void init(void) {
             }
 
 
-            /* 】 */
+            /* 】：GBK A1 BF；Big5 A1 6A */
             static const BYTE e1[] = {
                 0x81, 0x7A
             };
-
-            static const BYTE r1[] = {
+            static const BYTE r1_gbk[] = {
                 0xA1, 0xBF
             };
+            static const BYTE r1_big5[] = {
+                0xA1, 0x6A
+            };
+            const BYTE *r1 =
+                (g_codepage == 950) ? r1_big5 : r1_gbk;
 
 
-            /* 【 */
+            /* 【：GBK A1 BE；Big5 A1 69 */
             static const BYTE e2[] = {
                 0x81, 0x79
             };
-
-            static const BYTE r2[] = {
+            static const BYTE r2_gbk[] = {
                 0xA1, 0xBE
             };
+            static const BYTE r2_big5[] = {
+                0xA1, 0x69
+            };
+            const BYTE *r2 =
+                (g_codepage == 950) ? r2_big5 : r2_gbk;
 
 
             for (int i = 0; i < sc.n_close; i++) {
@@ -1392,24 +1405,32 @@ static void init(void) {
             }
 
 
-            /* 全形空白 */
+            /* 全形空白：GBK A1 A1；Big5 A1 40 */
             static const BYTE e3[] = {
                 0x81, 0x40
             };
-
-            static const BYTE r3[] = {
+            static const BYTE r3_gbk[] = {
                 0xA1, 0xA1
             };
+            static const BYTE r3_big5[] = {
+                0xA1, 0x40
+            };
+            const BYTE *r3 =
+                (g_codepage == 950) ? r3_big5 : r3_gbk;
 
 
             /* 半形空白 + 全形空白 */
             static const BYTE e4[] = {
                 0x20, 0x81, 0x40
             };
-
-            static const BYTE r4[] = {
+            static const BYTE r4_gbk[] = {
                 0x20, 0xA1, 0xA1
             };
+            static const BYTE r4_big5[] = {
+                0x20, 0xA1, 0x40
+            };
+            const BYTE *r4 =
+                (g_codepage == 950) ? r4_big5 : r4_gbk;
 
 
             for (int i = 0; i < sc.n_sp1; i++) {
@@ -1435,11 +1456,12 @@ static void init(void) {
 
 
             logf_(
-                "掃描成功: reader=%p (呼叫者 %d), 欄位 %d/5, ReaderWrap CP936 欄位 %d/5, FLS=%s, 】【 %d+%d, 全形空白 %d+%d",
+                "掃描成功: reader=%p (呼叫者 %d), 欄位 %d/5, ReaderWrap CP%u 欄位 %d/5, FLS=%s, 】【 %d+%d, 全形空白 %d+%d",
 
                 (void *)g_realReader,
                 sc.reader_callers,
                 sc.nsite,
+                (unsigned)g_codepage,
                 ok,
 
                 g_readerFls != FLS_OUT_OF_INDEXES
@@ -1513,7 +1535,8 @@ static void init(void) {
 
 
         logf_(
-            "params CP936 hook: 五個自動欄位=%d/5；ExtraSites=%d；標點(】【全形空白): %d 處",
+            "params CP%u hook: 五個自動欄位=%d/5；ExtraSites=%d；標點(】【全形空白): %d 處",
+            (unsigned)g_codepage,
             ok,
             extra,
             br
@@ -1524,10 +1547,10 @@ static void init(void) {
         /*
          * 原版文字模式：
          * 不掃描、不掛 ReaderWrap、不套用 ExtraSites，
-         * 也不修改 GBK 文字位元組。
+         * 也不修改目標碼頁文字位元組。
          */
         logf_(
-            "EncodingEnabled=0: skipped text conversion hook, params scan, ReaderWrap/ExtraSites and GBK byte patches; font hooks remain enabled"
+            "EncodingEnabled=0: skipped text conversion hook, params scan, ReaderWrap/ExtraSites and target-codepage byte patches; font hooks remain enabled"
         );
     }
 }

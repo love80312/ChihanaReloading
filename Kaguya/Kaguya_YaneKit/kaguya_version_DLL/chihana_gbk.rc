@@ -15,12 +15,12 @@ BEGIN
         BLOCK "040404B0"
         BEGIN
             VALUE "ProductName",      "ChihanaGBK"
-            VALUE "FileDescription",  "Kaguya 引擎遊戲 GBK 顯示補丁（version.dll 代理）"
+            VALUE "FileDescription",  "Kaguya 引擎 GBK／Big5 顯示補丁（version.dll 代理）"
             VALUE "FileVersion",      CHIHANA_VER_STR
             VALUE "ProductVersion",   CHIHANA_VER_STR
             VALUE "InternalName",     "version.dll"
             VALUE "OriginalFilename", "version.dll"
-            VALUE "Comments",         "版本 " CHIHANA_VER_STR "（" CHIHANA_BUILD_DATE "）。EncodingEnabled=1 時啟用完整 CP932/CP936 編碼與 GBK 修補；設為 0 時文字處理交回遊戲原版，只替換字型名稱並保留原始 lfCharSet。"
+            VALUE "Comments",         "版本 " CHIHANA_VER_STR "（" CHIHANA_BUILD_DATE "）。CodePage=936 使用 GBK；CodePage=950 使用 Big5。EncodingEnabled=0 時交回遊戲原始文字流程並保留原始 lfCharSet。"
             VALUE "LegalCopyright",   "ChihanaGBK 本地化輔助工具，僅供個人學習與本地化使用"
             VALUE "PrivateBuild",     CHIHANA_BUILD_DATE
         END
