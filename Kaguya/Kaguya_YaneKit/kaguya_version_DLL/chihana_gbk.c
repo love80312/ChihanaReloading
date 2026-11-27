@@ -1,19 +1,14 @@
 /* chihana_gbk.c -- version.dll 代理 DLL：讓 Kaguya 遊戲在簡中區域(ACP 936)下正確顯示指定 GBK 欄位
  *
- * ChihanaGBK v2.4.1.8
+ * ChihanaGBK v2.4.1.9
  *
- * 本版本以 v2.4.1.6 的 GBK 專用程式碼為基礎：
- *   1. 固定 ReaderWrap 內 CP936、外部 CP932，不提供 Big5 950 切換。
- *   2. 保留 UTF-8 Debug Log、PID / TID、LastError 保護。
- *   3. 保留五個 params ReaderWrap、FLS、GBK 標點及全形空白修補、字型 Hook。
+ * 本版本以 v2.4.1.8 為基礎，只增加 WCTMB 診斷：
+ *   1. 記錄 WideCharToMultiByte 呼叫返回位址及主 EXE RVA。
+ *   2. 配對同一執行緒緊接在前、參數相同的容量查詢與實際轉換。
+ *   3. 記錄需求容量、實際容量及差額，不更動轉換參數或緩衝區。
  *
- * 不更動：
- *   EncodingEnabled 的開關行為
- *   CP932 / CP936 轉換選擇
- *   五個 params ReaderWrap
- *   FLS
- *   GBK 標點及全形空白修補
- *   字型 Hook
+ * 保留：CP936 / CP932 路由、五個 params ReaderWrap、FLS、
+ * GBK 標點及全形空白修補、字型 Hook、UTF-8 Log 與 LastError 保護。
  */
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0600
@@ -38,18 +33,40 @@ static int  g_hscale = 100;
 static int  g_debug = 0;
 static int  g_encoding_enabled = 1;
 static char g_logpath[MAX_PATH];
+static DWORD g_exe_base = 0;
+static DWORD g_exe_size = 0;
 
 #define READER_MAX_DEPTH 128
 
 typedef struct {
     DWORD depth;
     DWORD returnAddress[READER_MAX_DEPTH];
+
+    /* Debug-only：配對 WCTMB 的需求容量查詢與下一次實際轉換。 */
+    LPCWSTR wctmbQueryText;
+    LPCSTR wctmbQueryDefaultChar;
+    LPBOOL wctmbQueryUsedDefaultChar;
+    UINT wctmbQueryCodePage;
+    DWORD wctmbQueryFlags;
+    int wctmbQueryWideLen;
+    int wctmbQueryRequired;
+    DWORD wctmbQueryCallerRva;
+    BOOL wctmbQueryValid;
 } ReaderThreadState;
 
 static DWORD g_readerFls = FLS_OUT_OF_INDEXES;
 
 __attribute__((used))
 volatile DWORD g_realReader = 0;
+
+/* 呼叫位置不在主 EXE 映像內時回傳 0xFFFFFFFF。 */
+static DWORD exe_rva_from_address(DWORD address) {
+    if (!g_exe_base || !g_exe_size || address < g_exe_base)
+        return 0xFFFFFFFFUL;
+
+    DWORD rva = address - g_exe_base;
+    return rva < g_exe_size ? rva : 0xFFFFFFFFUL;
+}
 
 /* ---------------- UTF-8 Log ---------------- */
 
@@ -567,6 +584,10 @@ reader_enter(DWORD return_address) {
     BOOL ok = FALSE;
 
     if (state && state->depth < READER_MAX_DEPTH) {
+        /* 不讓上一層 ReaderWrap 遺留的查詢資料跨範圍配對。 */
+        if (state->depth == 0)
+            state->wctmbQueryValid = FALSE;
+
         state->returnAddress[state->depth++] =
             return_address;
 
@@ -589,9 +610,14 @@ reader_leave(void) {
 
     DWORD return_address = 0;
 
-    if (state && state->depth != 0)
+    if (state && state->depth != 0) {
         return_address =
             state->returnAddress[--state->depth];
+
+        /* 查詢配對只允許存在於同一個 ReaderWrap 範圍。 */
+        if (state->depth == 0)
+            state->wctmbQueryValid = FALSE;
+    }
 
     SetLastError(saved);
 
@@ -599,6 +625,21 @@ reader_leave(void) {
 }
 
 /* ---------------- WideCharToMultiByte Hook ---------------- */
+
+/*
+ * noinline is intentional: __builtin_return_address(0) must identify
+ * the EXE call site, not a compiler-inlined copy of this hook.
+ */
+static int WINAPI My_WCTMB(
+    UINT cp,
+    DWORD fl,
+    LPCWSTR ws,
+    int wl,
+    LPSTR s,
+    int sl,
+    LPCSTR dc,
+    LPBOOL ud
+) __attribute__((noinline));
 
 static int WINAPI My_WCTMB(
     UINT cp,
@@ -611,13 +652,12 @@ static int WINAPI My_WCTMB(
     LPBOOL ud
 ) {
     UINT in = cp;
-
     BOOL in_reader = reader_active();
 
-    /*
-     * ReaderWrap 範圍內固定 CP936。
-     * ReaderWrap 範圍外維持 CP932。
-     */
+    DWORD caller = (DWORD)(ULONG_PTR)__builtin_return_address(0);
+    DWORD caller_rva = exe_rva_from_address(caller);
+
+    /* ReaderWrap 內固定 CP936；範圍外維持 CP932。 */
     if (cp == CP_THREAD_ACP)
         cp = in_reader ? 936 : 932;
 
@@ -663,10 +703,60 @@ static int WINAPI My_WCTMB(
             n * 2
         );
 
-        /*
-         * 只有 API 回傳成功時才記錄有效輸出長度。
-         * r=0 時不把容量不足的緩衝區內容誤認為完整結果。
-         */
+        BOOL is_query = (s == NULL && sl == 0);
+        BOOL paired = FALSE;
+        int paired_required = -1;
+        int capacity_gap = -1;
+        DWORD query_caller_rva = 0xFFFFFFFFUL;
+
+        ReaderThreadState *state =
+            reader_state_get(FALSE);
+
+        if (state) {
+
+            if (is_query) {
+
+                /* 只保存成功查詢，供同執行緒下一次轉換配對。 */
+                state->wctmbQueryValid = (r > 0);
+
+                if (r > 0) {
+                    paired_required = r;
+                    query_caller_rva = caller_rva;
+
+                    state->wctmbQueryText = ws;
+                    state->wctmbQueryDefaultChar = dc;
+                    state->wctmbQueryUsedDefaultChar = ud;
+                    state->wctmbQueryCodePage = cp;
+                    state->wctmbQueryFlags = fl;
+                    state->wctmbQueryWideLen = wl;
+                    state->wctmbQueryRequired = r;
+                    state->wctmbQueryCallerRva = caller_rva;
+                }
+
+            } else {
+
+                /* 參數完全相符才配對；每次實際轉換後消耗查詢紀錄。 */
+                if (state->wctmbQueryValid &&
+                    state->wctmbQueryText == ws &&
+                    state->wctmbQueryDefaultChar == dc &&
+                    state->wctmbQueryUsedDefaultChar == ud &&
+                    state->wctmbQueryCodePage == cp &&
+                    state->wctmbQueryFlags == fl &&
+                    state->wctmbQueryWideLen == wl) {
+
+                    paired = TRUE;
+                    paired_required = state->wctmbQueryRequired;
+                    query_caller_rva = state->wctmbQueryCallerRva;
+
+                    if (paired_required >= 0 && sl >= 0)
+                        capacity_gap = paired_required - sl;
+                }
+
+                state->wctmbQueryValid = FALSE;
+            }
+        }
+
+        /* 只有 API 成功時才讀取輸出緩衝區。 */
         if (r > 0 && s && sl > 0) {
 
             int out_len = r;
@@ -693,21 +783,28 @@ static int WINAPI My_WCTMB(
         }
 
         logf_(
-            "WCTMB in=%u->cp=%u wl=%d sl=%d r=%d err=%lu | UTF16: %s| out: %s",
+            "WCTMB kind=%s caller=%08lX rva=%08lX query_rva=%08lX paired=%d need=%d sl=%d gap=%d in=%u->cp=%u wl=%d r=%d err=%lu src=%p dst=%p | UTF16: %s| out: %s",
+            is_query ? "QUERY" : (s ? "CONVERT" : "OTHER"),
+            (unsigned long)caller,
+            (unsigned long)caller_rva,
+            (unsigned long)query_caller_rva,
+            paired,
+            paired_required,
+            sl,
+            capacity_gap,
             in,
             cp,
             wl,
-            sl,
             r,
             (unsigned long)(r == 0 ? api_error : 0),
+            (const void *)ws,
+            (void *)s,
             w,
             o
         );
     }
 
-    /*
-     * Debug 寫檔不得改變原本 API 的 LastError。
-     */
+    /* Debug 診斷不得改變原本 API 的 LastError。 */
     SetLastError(api_error);
 
     return r;
@@ -1116,6 +1213,22 @@ static void init(void) {
     );
 
     HMODULE exe = GetModuleHandleA(NULL);
+
+    /* 快取主 EXE 的映像範圍，供 WCTMB 呼叫位置 RVA 診斷使用。 */
+    g_exe_base = (DWORD)(ULONG_PTR)exe;
+    g_exe_size = 0;
+
+    if (exe) {
+        IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)exe;
+
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+            IMAGE_NT_HEADERS *nt =
+                (IMAGE_NT_HEADERS *)((BYTE *)exe + dos->e_lfanew);
+
+            if (nt->Signature == IMAGE_NT_SIGNATURE)
+                g_exe_size = nt->OptionalHeader.SizeOfImage;
+        }
+    }
 
     HMODULE gdi =
         GetModuleHandleA("gdi32.dll");
