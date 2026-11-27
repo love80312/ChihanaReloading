@@ -1,3 +1,4 @@
+
 name: ChihanaGBK version.dll Build
 
 # 獨立 DLL 建置：只允許手動執行，不會因 push 自動觸發。
@@ -22,9 +23,8 @@ jobs:
       RELEASE_DIR: artifacts/ChihanaGBK-x86
 
     steps:
-      # 不使用 actions/checkout：目前 repo 有 FreeMote gitlink，但沒有 .gitmodules URL，
-      # checkout action 的 auth-cleanup 會因此在 submodule foreach 階段失敗。
-      # 以一般 git fetch + sparse checkout 只取 DLL 原始碼，且不初始化任何 submodule。
+      # 不使用 actions/checkout，避免初始化 FreeMote gitlink。
+      # 只抓取 DLL 原始碼，不初始化任何 submodule。
       - name: Fetch DLL source without submodules
         shell: bash
         env:
@@ -126,7 +126,6 @@ jobs:
 
           cp "$BUILD_DIR/version.dll" "$RELEASE_DIR/version.dll"
           cp "$SOURCE_DIR/README.MD" "$RELEASE_DIR/README.MD"
-          # 直接使用 _ai_fix 分支中的 INI，避免封裝設定與原始碼不同步。
           cp "$SOURCE_DIR/ChihanaGBK.ini" "$RELEASE_DIR/ChihanaGBK.ini"
 
           {
@@ -182,21 +181,36 @@ jobs:
             exit 1
           fi
 
-          # 驗證必要設定：EncodingEnabled 可為 0/1，CodePage 僅支援 936/950。
-          # LOGFONT Charset 由 DLL 依 CodePage 自動對應，不再要求 INI 提供 Charset。
+          # 驗證必要設定：EncodingEnabled 必須為 0 或 1。
           if ! grep -Eiq '^[[:space:]]*EncodingEnabled[[:space:]]*=[[:space:]]*[01][[:space:]]*$' "$RELEASE_DIR/ChihanaGBK.ini"; then
             echo "Packaged INI must contain EncodingEnabled=0 or EncodingEnabled=1." >&2
             exit 1
           fi
 
-          if ! grep -Eiq '^[[:space:]]*CodePage[[:space:]]*=[[:space:]]*(936|950)[[:space:]]*$' "$RELEASE_DIR/ChihanaGBK.ini"; then
-            echo "Packaged INI must contain CodePage=936 (GBK) or CodePage=950 (Big5)." >&2
+          # Charset 是 LOGFONT.lfCharSet，允許範圍為 0～255。
+          # 不再使用 CodePage 設定；文字轉碼固定使用 GBK 936。
+          if ! awk -F= '
+            tolower($1) ~ /^[[:space:]]*charset[[:space:]]*$/ {
+              value = $2
+              gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+              count++
+              if (value !~ /^[0-9]+$/ || value < 0 || value > 255) {
+                invalid = 1
+              }
+            }
+            END {
+              if (count != 1 || invalid) {
+                exit 1
+              }
+            }
+          ' "$RELEASE_DIR/ChihanaGBK.ini"; then
+            echo "Packaged INI must contain exactly one valid Charset value (0-255)." >&2
             exit 1
           fi
 
           echo "PASS: Release DLL is x86 and exposes the required ANSI exports."
           echo "PASS: Release DLL is stripped and contains no Debug symbols."
-          echo "PASS: packaged INI contains valid EncodingEnabled and CodePage settings."
+          echo "PASS: packaged INI contains valid EncodingEnabled and Charset settings."
 
       - name: Upload Release DLL artifact
         uses: actions/upload-artifact@v7
@@ -205,4 +219,3 @@ jobs:
           path: artifacts/ChihanaGBK-x86/
           if-no-files-found: error
           compression-level: 6
-          
