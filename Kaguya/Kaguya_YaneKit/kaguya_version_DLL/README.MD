@@ -1,4 +1,4 @@
-# ChihanaGBK v2.4.1.0
+# ChihanaGBK v2.4.1.1
 
 `version.dll` 代理 DLL，供 Kaguya 引擎遊戲在簡中區域（Locale Emulator 轉簡中）下顯示指定 GBK 文字；不修改原版 EXE。
 
@@ -6,7 +6,7 @@
 
 1. `DllMain` 僅執行 `DisableThreadLibraryCalls`。系統 `version.dll` 載入、INI 讀取、IAT 修補及 EXE 掃描延後到第一次呼叫代理版本 API 時，並由 `InitOnceExecuteOnce` 保證只初始化一次。
 2. ReaderWrap 不再使用跨執行緒共用的返回位址與全域深度。每次呼叫的返回位址改存於該執行緒的 FLS 堆疊，支援多執行緒及巢狀呼叫；FLS 狀態以執行緒結束 callback 回收。
-3. 自動 CP936(GBK) 只套用 `DefaultFirst`、`DefaultSecond` 兩個預設姓名欄位。`GameTitle`、`DisplayTitle`、`Brand` 不再自動切換 CP936；一般資源字串仍維持 ACP 932。
+3. 自動 CP936(GBK) 套用原本已驗證的五個 params 欄位：`GameTitle`、`DisplayTitle`、`Brand`、`DefaultFirst`、`DefaultSecond`。一般資源字串仍維持 ACP 932。v2.4.1.0 曾將範圍縮小為兩個姓名欄位，造成 GBK 遊戲標題顯示錯誤；本版已恢復五個欄位的行為。
 4. 保留原有字型 hook、標點 `】【` 修補、全形空白修補、Debug 記錄，以及空白預設的 `ExtraSites` 進階手動設定。
 
 ## 安裝

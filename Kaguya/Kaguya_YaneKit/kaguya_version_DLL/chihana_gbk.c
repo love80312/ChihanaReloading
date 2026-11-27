@@ -3,7 +3,7 @@
  * 本階段以已測試可讀取 Kaguya 5.7 / 5.8 的 ChihanaGBK v2.4 為基礎，採最小範圍修改：
  *   1. DllMain 不再載入系統 DLL、讀 INI、掃描或修補程式；改由第一次呼叫代理 API 時執行一次初始化。
  *   2. ReaderWrap 改以 FLS 保存每個執行緒的返回位址堆疊，避免共享返回位址。
- *   3. 自動 CP936 hook 僅套用 DefaultFirst / DefaultSecond 兩個預設姓名欄位。
+ *   3. 自動 CP936 hook 恢復套用五個 params 欄位：GameTitle / DisplayTitle / Brand / DefaultFirst / DefaultSecond。
  *
  * 保留原有字型 hook、一般資源字串 ACP 932、標點與全形空白修補、掃描器簽章及額外 ExtraSites 功能。
  */
@@ -322,8 +322,8 @@ static void init(void) {
         g_realReader = (DWORD)exe + sc.reader;
         g_readerFls = FlsAlloc(reader_state_cleanup);
         if (g_readerFls != FLS_OUT_OF_INDEXES) {
-            /* site[3] / site[4] = DefaultFirst / DefaultSecond；其餘三個欄位維持 ACP 932。 */
-            for (int i = 3; i < 5; i++) if (sc.site[i]) ok += patch_reader_site((DWORD)exe + sc.site[i]);
+            /* 恢復 v2.4.0 已驗證的五個 params 欄位 CP936 行為。 */
+            for (int i = 0; i < 5; i++) if (sc.site[i]) ok += patch_reader_site((DWORD)exe + sc.site[i]);
         } else {
             logf_("FLS allocation failed: ReaderWrap hook skipped; other patches remain enabled");
         }
@@ -334,7 +334,7 @@ static void init(void) {
         static const BYTE e3[] = {0x81,0x40}, r3[] = {0xA1,0xA1}, e4[] = {0x20,0x81,0x40}, r4[] = {0x20,0xA1,0xA1};
         for (int i = 0; i < sc.n_sp1; i++) br += patch_bytes((DWORD)exe + sc.sp1[i], e3, r3, 2);
         for (int i = 0; i < sc.n_sp2; i++) br += patch_bytes((DWORD)exe + sc.sp2[i], e4, r4, 3);
-        logf_("掃描成功: reader=%p (呼叫者 %d), 欄位 %d/5, ReaderWrap 姓名欄位 %d/2, FLS=%s, 】【 %d+%d, 全形空白 %d+%d",
+        logf_("掃描成功: reader=%p (呼叫者 %d), 欄位 %d/5, ReaderWrap CP936 欄位 %d/5, FLS=%s, 】【 %d+%d, 全形空白 %d+%d",
               (void *)g_realReader, sc.reader_callers, sc.nsite, ok,
               g_readerFls != FLS_OUT_OF_INDEXES ? "OK" : "FAILED",
               sc.n_close, sc.n_open, sc.n_sp1, sc.n_sp2);
@@ -346,7 +346,7 @@ static void init(void) {
         char list[256]; GetPrivateProfileStringA("Params", "ExtraSites", "", list, sizeof list, ini);
         for (char *t = strtok(list, ", "); t; t = strtok(NULL, ", ")) extra += patch_reader_site((DWORD)strtoul(t, NULL, 0));
     }
-    logf_("params CP936 hook: DefaultFirst/DefaultSecond=%d/2；ExtraSites=%d；標點(】【全形空白): %d 處", ok, extra, br);
+    logf_("params CP936 hook: 五個自動欄位=%d/5；ExtraSites=%d；標點(】【全形空白): %d 處", ok, extra, br);
 }
 
 /* InitOnce 確保多執行緒首次呼叫代理 API 時，只初始化一次。此處已離開本 DLL 的 DllMain。 */

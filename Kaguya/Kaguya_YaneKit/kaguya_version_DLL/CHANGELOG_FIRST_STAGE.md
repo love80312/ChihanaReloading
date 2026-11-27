@@ -1,26 +1,25 @@
-# v2.4.1.0 第一階段修改紀錄
+# v2.4.1.1 修正紀錄
 
-## 修改內容
+## 修正原因
 
-- `DllMain` 不再執行 `LoadLibraryA`、INI 讀取、EXE 掃描或 IAT / 程式碼修補；改由代理 API 首次呼叫時透過 `InitOnceExecuteOnce` 執行初始化。
-- 移除全域 `g_savedRet` 與 `g_gbkDepth`。
-- ReaderWrap 的返回位址存入執行緒專屬 FLS 堆疊，不使用可能被原 reader 函式序言覆寫的 caller-stack 暫存區；保留原 reader 的 EAX/ECX/EDX 輸入暫存器、EAX/EDX 返回值及 cdecl / callee-clean 堆疊效果。
-- 使用 `FlsAlloc` / `FlsGetValue` / `FlsSetValue` 管理每個執行緒的 reader 返回位址堆疊，並以 FLS callback 回收執行緒狀態；FLS 建立失敗時跳過 ReaderWrap hook，不中止其他字型與標點修補。
-- 自動 ReaderWrap hook 限定掃描器 `site[3]`、`site[4]`，即 `DefaultFirst`、`DefaultSecond`。
-- `ExtraSites` 保留作為明確手動追加項目；預設空白，不會額外套用。
-- 更新版本資源、INI 註解及 README。
+- v2.4.1.0 將自動 CP936 ReaderWrap hook 限縮為 `DefaultFirst` / `DefaultSecond` 兩個預設姓名欄位。
+- 實際測試 Kaguya 5.8 時，遊戲標題因此顯示錯誤；這是 CP936 套用範圍縮小造成的回歸，不是 `[SCR-PARAMS]v05.8` 標頭格式錯誤。
 
-## 未修改
+## 本版修正
 
-- `kaguya_scan.h` 全部掃描邏輯與簽章。
-- `pxxxx.dat`、`message.dat` 讀取流程。
-- 原有三個 ANSI DLL 匯出名稱與呼叫介面。
-- 字型、標點、全形空白與 Debug 功能。
+- 恢復五個 params 文字欄位的自動 CP936：`GameTitle`、`DisplayTitle`、`Brand`、`DefaultFirst`、`DefaultSecond`。
+- 保留 v2.4.1.0 的 `DllMain` 延後初始化、`InitOnceExecuteOnce` 及 FLS 每執行緒返回位址堆疊。
+- 保留原有字型 hook、一般資源字串 ACP 932、`】【` 標點與全形空白修補、Debug 記錄及 `ExtraSites`。
+- `kaguya_scan.h` 不修改；`pxxxx.dat` / `message.dat` 讀取流程不修改。
 
 ## 驗證狀態
 
-- x86 COFF 組語片段已用 Clang 17 組譯成功。
-- 尚未使用專案原本的 Windows MinGW 環境完成 DLL 全量編譯；目前執行環境缺少 MinGW-w64 Windows SDK headers / linker。
-- 尚未在 Kaguya 5.7 / 5.8 遊戲內執行新 DLL。必須先通過 GitHub Actions x86 build，再用原本已成功的 5.7、5.8 樣本驗證 `pxxxx.dat`、`message.dat`、姓名欄位、標題、字型及視窗顯示。
+- 此版尚待 GitHub Actions x86 DLL 編譯及 Kaguya 5.7 / 5.8 實機回歸測試。
+- 優先確認遊戲標題、品牌、預設姓名，以及 `pxxxx.dat` / `message.dat` 讀取與顯示。
 
-`kaguya_scan.h` 不包含於替換包；請保留 `_ai_fix` 分支原檔。此次刻意不改動掃描器，避免改變已驗證的 5.7 / 5.8 定位結果。
+## 本次比對與檢查
+
+- 對照 v2.4.1.0，`chihana_gbk.c` 的執行邏輯變更僅將自動 ReaderWrap 迴圈由 `site[3..4]` 恢復為 `site[0..4]`；FLS 狀態管理、ReaderWrap 組語、InitOnce 初始化及掃描器均未改動。
+- 使用者提供的 Debug=2 記錄中，視窗標題包含 `96 85`（CP932 的「妹」）及 `81 49`（CP932 的全形驚嘆號），而預設姓名轉碼記錄已使用 CP936。這支持標題欄位仍走 ACP 932 的判斷。
+- 修正版 ReaderWrap x86 COFF 組語片段已由 Clang 交叉組譯成功；完整 Windows DLL 尚須由專案 GitHub Actions 編譯。
+- 本次只做原始碼與組譯層檢查，不能取代 Kaguya 5.7 / 5.8 實機回歸測試。
