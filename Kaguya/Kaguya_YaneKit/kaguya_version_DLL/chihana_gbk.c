@@ -1,384 +1,1583 @@
+
 /* chihana_gbk.c -- version.dll 代理 DLL：讓 Kaguya 遊戲在簡中區域(ACP 936)下正確顯示指定 GBK 欄位
  *
- * 本階段以已測試可讀取 Kaguya 5.7 / 5.8 的 ChihanaGBK v2.4 為基礎，採最小範圍修改：
- *   1. DllMain 不再載入系統 DLL、讀 INI、掃描或修補程式；改由第一次呼叫代理 API 時執行一次初始化。
- *   2. ReaderWrap 改以 FLS 保存每個執行緒的返回位址堆疊，避免共享返回位址。
- *   3. 自動 CP936 hook 恢復套用五個 params 欄位：GameTitle / DisplayTitle / Brand / DefaultFirst / DefaultSecond。
- *   4. EncodingEnabled=0 時不介入文字編碼與 params/GBK 修補，只保留字型 hook。
+ * ChihanaGBK v2.4.1.6
  *
- * EncodingEnabled=1 時完整保留原有 CP932/CP936、標點、全形空白、掃描器及 ExtraSites 功能。
+ * 本版本以已測試成功的 v2.4.1.5 為基礎，只改善 Debug Log：
+ *   1. Log 統一使用 UTF-8，新的 Log 檔案寫入 UTF-8 BOM。
+ *   2. ANSI 字串轉成 UTF-8，避免 LoadLibraryA 路徑亂碼。
+ *   3. 每行加入 PID / TID，辨識不同程序及執行緒。
+ *   4. WCTMB 記錄 API 回傳值、GetLastError 及有效輸出長度。
+ *   5. Debug 寫檔後恢復原 API 的 LastError。
+ *
+ * 不更動：
+ *   EncodingEnabled 的開關行為
+ *   CP932 / CP936 轉換選擇
+ *   五個 params ReaderWrap
+ *   FLS
+ *   GBK 標點及全形空白修補
+ *   字型 Hook
  */
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0600
 #endif
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
+
 #include "kaguya_scan.h"
 #include "chihana_version.h"
 
-/* ---------------- 設定（可由 ChihanaGBK.ini 覆蓋） ---------------- */
+/* ---------------- 設定 ---------------- */
+
 static char g_face[LF_FACESIZE] = "SimHei";
-static int  g_charset = 134;      /* GB2312_CHARSET */
-static int  g_weight  = 0;        /* 0 = 不改；>0：lfWeight < 400 的字型改成此值 */
-static int  g_hscale  = 100;      /* 字高縮放百分比 */
-static int  g_debug   = 0;
-static int  g_encoding_enabled = 1; /* 1 = 完整 ChihanaGBK；0 = 原版文字處理，只套用自訂字型 */
+static int  g_charset = 134;
+static int  g_weight = 0;
+static int  g_hscale = 100;
+static int  g_debug = 0;
+static int  g_encoding_enabled = 1;
 static char g_logpath[MAX_PATH];
 
 #define READER_MAX_DEPTH 128
+
 typedef struct {
     DWORD depth;
     DWORD returnAddress[READER_MAX_DEPTH];
 } ReaderThreadState;
 
-static DWORD g_readerFls = FLS_OUT_OF_INDEXES; /* FLS slot：每個執行緒獨立保存 ReaderWrap 返回位址堆疊 */
-__attribute__((used)) volatile DWORD g_realReader = 0; /* params string16 reader（載入時掃描得到） */
+static DWORD g_readerFls = FLS_OUT_OF_INDEXES;
 
+__attribute__((used))
+volatile DWORD g_realReader = 0;
+
+
+/* ---------------- UTF-8 Log ---------------- */
+
+/*
+ * 所有 Log 統一使用 UTF-8。
+ *
+ * 新檔案：
+ *   寫入 UTF-8 BOM
+ *
+ * 每行：
+ *   [PID=xxxxx TID=xxxxx] 訊息
+ *
+ * 注意：
+ *   舊版 ChihanaGBK.log 可能混有舊編碼內容。
+ *   第一次使用 v2.4.1.6 前，請先刪除舊 Log。
+ */
 static void logf_(const char *fmt, ...) {
     if (!g_debug) return;
-    FILE *f = fopen(g_logpath, "a"); if (!f) return;
-    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap); fputc('\n', f); fclose(f);
-}
 
-/* ---------------- 真正的 version.dll 轉接 ---------------- */
-static HMODULE g_realVer;
-typedef BOOL  (WINAPI *PFN_GFVI)(LPCSTR, DWORD, DWORD, LPVOID);
-typedef DWORD (WINAPI *PFN_GFVIS)(LPCSTR, LPDWORD);
-typedef BOOL  (WINAPI *PFN_VQV)(LPCVOID, LPCSTR, LPVOID *, PUINT);
-static PFN_GFVI  p_GFVI;  static PFN_GFVIS p_GFVIS;  static PFN_VQV p_VQV;
+    char line[4096];
 
-static BOOL ensure_initialized(void);
+    int prefix = snprintf(
+        line,
+        sizeof(line),
+        "[PID=%lu TID=%lu] ",
+        (unsigned long)GetCurrentProcessId(),
+        (unsigned long)GetCurrentThreadId()
+    );
 
-__declspec(dllexport) BOOL WINAPI GetFileVersionInfoA(LPCSTR a, DWORD b, DWORD c, LPVOID d) {
-    DWORD saved = GetLastError();
-    if (!ensure_initialized()) { SetLastError(saved); return FALSE; }
-    SetLastError(saved);
-    return p_GFVI ? p_GFVI(a, b, c, d) : FALSE;
-}
-__declspec(dllexport) DWORD WINAPI GetFileVersionInfoSizeA(LPCSTR a, LPDWORD b) {
-    DWORD saved = GetLastError();
-    if (!ensure_initialized()) { SetLastError(saved); return 0; }
-    SetLastError(saved);
-    return p_GFVIS ? p_GFVIS(a, b) : 0;
-}
-__declspec(dllexport) BOOL WINAPI VerQueryValueA(LPCVOID a, LPCSTR b, LPVOID *c, PUINT d) {
-    DWORD saved = GetLastError();
-    if (!ensure_initialized()) { SetLastError(saved); return FALSE; }
-    SetLastError(saved);
-    return p_VQV ? p_VQV(a, b, c, d) : FALSE;
-}
+    if (prefix < 0 || prefix >= (int)sizeof(line) - 3)
+        return;
 
-static void load_real_version(void) {
-    char p[MAX_PATH];
-    UINT n = GetSystemDirectoryA(p, MAX_PATH);
-    static const char suffix[] = "\\version.dll";
-    if (!n || n >= MAX_PATH || n + sizeof(suffix) > MAX_PATH) return;
-    memcpy(p + n, suffix, sizeof(suffix));
+    va_list ap;
+    va_start(ap, fmt);
 
-    g_realVer = LoadLibraryA(p);
-    if (!g_realVer) return;
-    p_GFVI  = (PFN_GFVI)  GetProcAddress(g_realVer, "GetFileVersionInfoA");
-    p_GFVIS = (PFN_GFVIS) GetProcAddress(g_realVer, "GetFileVersionInfoSizeA");
-    p_VQV   = (PFN_VQV)   GetProcAddress(g_realVer, "VerQueryValueA");
-}
+    int body_cap = (int)sizeof(line) - prefix - 3;
 
-/* ---------------- IAT 修補 ---------------- */
-static BOOL patch_iat(HMODULE mod, const char *dll, const char *func, void *hook) {
-    BYTE *b = (BYTE *)mod;
-    IMAGE_DOS_HEADER *dh = (IMAGE_DOS_HEADER *)b;
-    if (dh->e_magic != IMAGE_DOS_SIGNATURE) return FALSE;
-    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(b + dh->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return FALSE;
-    DWORD rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-    if (!rva) return FALSE;
-    for (IMAGE_IMPORT_DESCRIPTOR *d = (IMAGE_IMPORT_DESCRIPTOR *)(b + rva); d->Name; d++) {
-        if (lstrcmpiA((const char *)(b + d->Name), dll)) continue;
-        IMAGE_THUNK_DATA *oft = (IMAGE_THUNK_DATA *)(b + (d->OriginalFirstThunk ? d->OriginalFirstThunk : d->FirstThunk));
-        IMAGE_THUNK_DATA *ft = (IMAGE_THUNK_DATA *)(b + d->FirstThunk);
-        for (; oft->u1.AddressOfData; oft++, ft++) {
-            if (IMAGE_SNAP_BY_ORDINAL32(oft->u1.Ordinal)) continue;
-            IMAGE_IMPORT_BY_NAME *n = (IMAGE_IMPORT_BY_NAME *)(b + oft->u1.AddressOfData);
-            if (strcmp((const char *)n->Name, func)) continue;
-            DWORD old;
-            if (!VirtualProtect(&ft->u1.Function, 4, PAGE_READWRITE, &old)) return FALSE;
-            ft->u1.Function = (DWORD)hook;
-            VirtualProtect(&ft->u1.Function, 4, old, &old);
-            return TRUE;
-        }
+    int body_len = vsnprintf(
+        line + prefix,
+        (size_t)body_cap + 1,
+        fmt,
+        ap
+    );
+
+    va_end(ap);
+
+    if (body_len < 0)
+        return;
+
+    if (body_len > body_cap)
+        body_len = body_cap;
+
+    size_t total = (size_t)prefix + (size_t)body_len;
+
+    line[total++] = '\r';
+    line[total++] = '\n';
+
+    FILE *f = fopen(g_logpath, "ab+");
+
+    if (!f)
+        return;
+
+    /* 新檔案才寫入 BOM，不覆蓋舊檔案。 */
+    if (fseek(f, 0, SEEK_END) == 0 && ftell(f) == 0) {
+        static const unsigned char bom[3] = {
+            0xEF, 0xBB, 0xBF
+        };
+
+        fwrite(bom, 1, sizeof(bom), f);
     }
+
+    fwrite(line, 1, total, f);
+
+    fclose(f);
+}
+
+
+/*
+ * 將 ANSI 字串轉成 UTF-8。
+ *
+ * 優先使用目前執行緒 ANSI Code Page，
+ * 再以系統 ANSI Code Page 嘗試。
+ *
+ * 使用 flags=0，避免一般舊式 ANSI Code Page
+ * 不支援 MB_ERR_INVALID_CHARS 而轉換失敗。
+ */
+static BOOL ansi_to_utf8(
+    const char *src,
+    char *dst,
+    int dst_cap
+) {
+    if (!src || !dst || dst_cap <= 0)
+        return FALSE;
+
+    dst[0] = 0;
+
+    const UINT codepages[2] = {
+        CP_THREAD_ACP,
+        CP_ACP
+    };
+
+    for (int i = 0; i < 2; i++) {
+
+        if (i == 1 && codepages[1] == codepages[0])
+            continue;
+
+        int wide_count = MultiByteToWideChar(
+            codepages[i],
+            0,
+            src,
+            -1,
+            NULL,
+            0
+        );
+
+        if (wide_count <= 0)
+            continue;
+
+        WCHAR *wide = (WCHAR *)HeapAlloc(
+            GetProcessHeap(),
+            0,
+            (SIZE_T)wide_count * sizeof(WCHAR)
+        );
+
+        if (!wide)
+            return FALSE;
+
+        BOOL ok = FALSE;
+
+        if (MultiByteToWideChar(
+                codepages[i],
+                0,
+                src,
+                -1,
+                wide,
+                wide_count
+            ) == wide_count) {
+
+            int utf8_count = WideCharToMultiByte(
+                CP_UTF8,
+                0,
+                wide,
+                -1,
+                NULL,
+                0,
+                NULL,
+                NULL
+            );
+
+            if (utf8_count > 0 && utf8_count <= dst_cap) {
+
+                int written = WideCharToMultiByte(
+                    CP_UTF8,
+                    0,
+                    wide,
+                    -1,
+                    dst,
+                    dst_cap,
+                    NULL,
+                    NULL
+                );
+
+                ok = (written == utf8_count);
+            }
+        }
+
+        HeapFree(GetProcessHeap(), 0, wide);
+
+        if (ok)
+            return TRUE;
+
+        dst[0] = 0;
+    }
+
     return FALSE;
 }
 
-/* ---------------- 追蹤（Debug=2） ---------------- */
-static void hex_(char *dst, size_t n, const unsigned char *p, int len) {
-    size_t o = 0; for (int i = 0; i < len && o + 4 < n; i++) o += wsprintfA(dst + o, "%02X ", p[i]); dst[o] = 0;
+
+/* ---------------- 真正的 version.dll 轉接 ---------------- */
+
+static HMODULE g_realVer;
+
+typedef BOOL (WINAPI *PFN_GFVI)(
+    LPCSTR, DWORD, DWORD, LPVOID
+);
+
+typedef DWORD (WINAPI *PFN_GFVIS)(
+    LPCSTR, LPDWORD
+);
+
+typedef BOOL (WINAPI *PFN_VQV)(
+    LPCVOID, LPCSTR, LPVOID *, PUINT
+);
+
+static PFN_GFVI p_GFVI;
+static PFN_GFVIS p_GFVIS;
+static PFN_VQV p_VQV;
+
+static BOOL ensure_initialized(void);
+
+
+__declspec(dllexport)
+BOOL WINAPI GetFileVersionInfoA(
+    LPCSTR a,
+    DWORD b,
+    DWORD c,
+    LPVOID d
+) {
+    DWORD saved = GetLastError();
+
+    if (!ensure_initialized()) {
+        SetLastError(saved);
+        return FALSE;
+    }
+
+    SetLastError(saved);
+
+    return p_GFVI ? p_GFVI(a, b, c, d) : FALSE;
 }
 
-/* ---------------- hooks ---------------- */
-typedef HFONT (WINAPI *PFN_CFIA)(const LOGFONTA *);
-typedef int   (WINAPI *PFN_WCTMB)(UINT, DWORD, LPCWSTR, int, LPSTR, int, LPCSTR, LPBOOL);
-typedef HMODULE (WINAPI *PFN_LLA)(LPCSTR);
-static PFN_CFIA real_CFIA; static PFN_WCTMB real_WCTMB; static PFN_LLA real_LLA;
 
-static HFONT WINAPI My_CFIA(const LOGFONTA *in) {
-    if (!in) return real_CFIA(in);
-    LOGFONTA lf = *in;                         /* 不修改呼叫者的結構 */
-    /* 原版文字模式只替換字型名稱，不覆寫遊戲原本的字集；Charset 僅在編碼模式啟用時套用。 */
-    if (g_encoding_enabled) lf.lfCharSet = (BYTE)g_charset;
-    if (g_face[0]) { memset(lf.lfFaceName, 0, LF_FACESIZE); lstrcpynA(lf.lfFaceName, g_face, LF_FACESIZE); }
-    if (g_weight > 0 && lf.lfWeight < 400) lf.lfWeight = g_weight;
+__declspec(dllexport)
+DWORD WINAPI GetFileVersionInfoSizeA(
+    LPCSTR a,
+    LPDWORD b
+) {
+    DWORD saved = GetLastError();
+
+    if (!ensure_initialized()) {
+        SetLastError(saved);
+        return 0;
+    }
+
+    SetLastError(saved);
+
+    return p_GFVIS ? p_GFVIS(a, b) : 0;
+}
+
+
+__declspec(dllexport)
+BOOL WINAPI VerQueryValueA(
+    LPCVOID a,
+    LPCSTR b,
+    LPVOID *c,
+    PUINT d
+) {
+    DWORD saved = GetLastError();
+
+    if (!ensure_initialized()) {
+        SetLastError(saved);
+        return FALSE;
+    }
+
+    SetLastError(saved);
+
+    return p_VQV ? p_VQV(a, b, c, d) : FALSE;
+}
+
+
+static void load_real_version(void) {
+    char p[MAX_PATH];
+
+    UINT n = GetSystemDirectoryA(p, MAX_PATH);
+
+    static const char suffix[] = "\\version.dll";
+
+    if (!n ||
+        n >= MAX_PATH ||
+        n + sizeof(suffix) > MAX_PATH)
+        return;
+
+    memcpy(p + n, suffix, sizeof(suffix));
+
+    g_realVer = LoadLibraryA(p);
+
+    if (!g_realVer)
+        return;
+
+    p_GFVI = (PFN_GFVI)GetProcAddress(
+        g_realVer,
+        "GetFileVersionInfoA"
+    );
+
+    p_GFVIS = (PFN_GFVIS)GetProcAddress(
+        g_realVer,
+        "GetFileVersionInfoSizeA"
+    );
+
+    p_VQV = (PFN_VQV)GetProcAddress(
+        g_realVer,
+        "VerQueryValueA"
+    );
+}
+
+
+/* ---------------- IAT 修補 ---------------- */
+
+static BOOL patch_iat(
+    HMODULE mod,
+    const char *dll,
+    const char *func,
+    void *hook
+) {
+    BYTE *b = (BYTE *)mod;
+
+    IMAGE_DOS_HEADER *dh =
+        (IMAGE_DOS_HEADER *)b;
+
+    if (dh->e_magic != IMAGE_DOS_SIGNATURE)
+        return FALSE;
+
+    IMAGE_NT_HEADERS *nt =
+        (IMAGE_NT_HEADERS *)(b + dh->e_lfanew);
+
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return FALSE;
+
+    DWORD rva =
+        nt->OptionalHeader.DataDirectory[
+            IMAGE_DIRECTORY_ENTRY_IMPORT
+        ].VirtualAddress;
+
+    if (!rva)
+        return FALSE;
+
+    for (
+        IMAGE_IMPORT_DESCRIPTOR *d =
+            (IMAGE_IMPORT_DESCRIPTOR *)(b + rva);
+        d->Name;
+        d++
+    ) {
+        if (lstrcmpiA(
+                (const char *)(b + d->Name),
+                dll
+            ))
+            continue;
+
+        IMAGE_THUNK_DATA *oft =
+            (IMAGE_THUNK_DATA *)(
+                b + (
+                    d->OriginalFirstThunk
+                    ? d->OriginalFirstThunk
+                    : d->FirstThunk
+                )
+            );
+
+        IMAGE_THUNK_DATA *ft =
+            (IMAGE_THUNK_DATA *)(b + d->FirstThunk);
+
+        for (; oft->u1.AddressOfData; oft++, ft++) {
+
+            if (IMAGE_SNAP_BY_ORDINAL32(oft->u1.Ordinal))
+                continue;
+
+            IMAGE_IMPORT_BY_NAME *n =
+                (IMAGE_IMPORT_BY_NAME *)(
+                    b + oft->u1.AddressOfData
+                );
+
+            if (strcmp((const char *)n->Name, func))
+                continue;
+
+            DWORD old;
+
+            if (!VirtualProtect(
+                    &ft->u1.Function,
+                    4,
+                    PAGE_READWRITE,
+                    &old
+                ))
+                return FALSE;
+
+            ft->u1.Function = (DWORD)hook;
+
+            VirtualProtect(
+                &ft->u1.Function,
+                4,
+                old,
+                &old
+            );
+
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+
+/* ---------------- HEX Log ---------------- */
+
+static void hex_(
+    char *dst,
+    size_t n,
+    const unsigned char *p,
+    int len
+) {
+    size_t o = 0;
+
+    for (int i = 0; i < len && o + 4 < n; i++) {
+        o += wsprintfA(
+            dst + o,
+            "%02X ",
+            p[i]
+        );
+    }
+
+    dst[o] = 0;
+}
+
+
+/* ---------------- hooks ---------------- */
+
+typedef HFONT (WINAPI *PFN_CFIA)(
+    const LOGFONTA *
+);
+
+typedef int (WINAPI *PFN_WCTMB)(
+    UINT,
+    DWORD,
+    LPCWSTR,
+    int,
+    LPSTR,
+    int,
+    LPCSTR,
+    LPBOOL
+);
+
+typedef HMODULE (WINAPI *PFN_LLA)(
+    LPCSTR
+);
+
+static PFN_CFIA real_CFIA;
+static PFN_WCTMB real_WCTMB;
+static PFN_LLA real_LLA;
+
+
+/* ---------------- 字型 Hook ---------------- */
+
+static HFONT WINAPI My_CFIA(
+    const LOGFONTA *in
+) {
+    if (!in)
+        return real_CFIA(in);
+
+    LOGFONTA lf = *in;
+
+    /*
+     * EncodingEnabled=0：
+     * 保留遊戲原始 lfCharSet，只替換字型名稱。
+     *
+     * EncodingEnabled=1：
+     * 使用 INI Charset。
+     */
+    if (g_encoding_enabled)
+        lf.lfCharSet = (BYTE)g_charset;
+
+    if (g_face[0]) {
+        memset(lf.lfFaceName, 0, LF_FACESIZE);
+
+        lstrcpynA(
+            lf.lfFaceName,
+            g_face,
+            LF_FACESIZE
+        );
+    }
+
+    if (g_weight > 0 && lf.lfWeight < 400)
+        lf.lfWeight = g_weight;
+
     if (g_hscale != 100) {
         long h = lf.lfHeight * g_hscale;
-        lf.lfHeight = (LONG)((h < 0) ? (h - 50) / 100 : (h + 50) / 100);
+
+        lf.lfHeight = (LONG)(
+            (h < 0)
+            ? (h - 50) / 100
+            : (h + 50) / 100
+        );
     }
+
     return real_CFIA(&lf);
 }
 
-/* 每個執行緒使用獨立 FLS 狀態；FLS callback 在線程結束時回收該狀態。 */
+
+/* ---------------- FLS 狀態 ---------------- */
+
 static VOID CALLBACK reader_state_cleanup(PVOID data) {
-    if (data) HeapFree(GetProcessHeap(), 0, data);
+    if (data)
+        HeapFree(GetProcessHeap(), 0, data);
 }
 
+
 static ReaderThreadState *reader_state_get(BOOL create) {
-    if (g_readerFls == FLS_OUT_OF_INDEXES) return NULL;
-    ReaderThreadState *state = (ReaderThreadState *)FlsGetValue(g_readerFls);
+    if (g_readerFls == FLS_OUT_OF_INDEXES)
+        return NULL;
+
+    ReaderThreadState *state =
+        (ReaderThreadState *)FlsGetValue(g_readerFls);
+
     if (!state && create) {
+
         HANDLE heap = GetProcessHeap();
-        state = (ReaderThreadState *)HeapAlloc(heap, HEAP_ZERO_MEMORY, sizeof(*state));
-        if (!state) return NULL;
+
+        state = (ReaderThreadState *)HeapAlloc(
+            heap,
+            HEAP_ZERO_MEMORY,
+            sizeof(*state)
+        );
+
+        if (!state)
+            return NULL;
+
         if (!FlsSetValue(g_readerFls, state)) {
             HeapFree(heap, 0, state);
             return NULL;
         }
     }
+
     return state;
 }
 
+
 static BOOL reader_active(void) {
     DWORD saved = GetLastError();
-    ReaderThreadState *state = reader_state_get(FALSE);
-    BOOL active = (state && state->depth != 0);
+
+    ReaderThreadState *state =
+        reader_state_get(FALSE);
+
+    BOOL active =
+        (state && state->depth != 0);
+
     SetLastError(saved);
+
     return active;
 }
 
-/* 由 ReaderWrap 組語呼叫。成功時把原返回位址推入本執行緒的 FLS 堆疊。 */
-BOOL __attribute__((noinline, used)) reader_enter(DWORD return_address) {
+
+/* 由 ReaderWrap 組語呼叫。 */
+
+BOOL __attribute__((noinline, used))
+reader_enter(DWORD return_address) {
     DWORD saved = GetLastError();
-    ReaderThreadState *state = reader_state_get(TRUE);
+
+    ReaderThreadState *state =
+        reader_state_get(TRUE);
+
     BOOL ok = FALSE;
+
     if (state && state->depth < READER_MAX_DEPTH) {
-        state->returnAddress[state->depth++] = return_address;
+        state->returnAddress[state->depth++] =
+            return_address;
+
         ok = TRUE;
     }
+
     SetLastError(saved);
+
     return ok;
 }
 
-/* 由 ReaderWrap 組語呼叫。彈出本次呼叫的返回位址，供 wrapper 最後 ret 使用。 */
-DWORD __attribute__((noinline, used)) reader_leave(void) {
+
+/* 由 ReaderWrap 組語呼叫。 */
+
+DWORD __attribute__((noinline, used))
+reader_leave(void) {
     DWORD saved = GetLastError();
-    ReaderThreadState *state = reader_state_get(FALSE);
+
+    ReaderThreadState *state =
+        reader_state_get(FALSE);
+
     DWORD return_address = 0;
+
     if (state && state->depth != 0)
-        return_address = state->returnAddress[--state->depth];
+        return_address =
+            state->returnAddress[--state->depth];
+
     SetLastError(saved);
+
     return return_address;
 }
 
-static int WINAPI My_WCTMB(UINT cp, DWORD fl, LPCWSTR ws, int wl, LPSTR s, int sl, LPCSTR dc, LPBOOL ud) {
+
+/* ---------------- WideCharToMultiByte Hook ---------------- */
+
+static int WINAPI My_WCTMB(
+    UINT cp,
+    DWORD fl,
+    LPCWSTR ws,
+    int wl,
+    LPSTR s,
+    int sl,
+    LPCSTR dc,
+    LPBOOL ud
+) {
     UINT in = cp;
+
     BOOL in_reader = reader_active();
-    if (cp == CP_THREAD_ACP) cp = in_reader ? 936 : 932;
-    int r = real_WCTMB(cp, fl, ws, wl, s, sl, dc, ud);
+
+    /*
+     * 保留 v2.4.1.5 原有 CP932 / CP936 判斷。
+     */
+    if (cp == CP_THREAD_ACP)
+        cp = in_reader ? 936 : 932;
+
+    int r = real_WCTMB(
+        cp,
+        fl,
+        ws,
+        wl,
+        s,
+        sl,
+        dc,
+        ud
+    );
+
+    /*
+     * 必須在任何 Debug 操作前取得 API 的錯誤碼。
+     */
+    DWORD api_error = GetLastError();
+
     if (g_debug >= 2 && in_reader && ws) {
-        char w[300], o[300]; int n = wl;
-        if (n < 0) { n = 0; while (n < 64 && ws[n]) n++; n++; if (n > 64) n = 64; }   /* 含結尾 NUL */
-        if (n > 40) n = 40;
-        hex_(w, sizeof w, (const unsigned char *)ws, n * 2);
-        o[0] = 0; if (s && sl > 0) hex_(o, sizeof o, (const unsigned char *)s, sl > 48 ? 48 : sl);
-        logf_("WCTMB in=%u->cp=%u wl=%d sl=%d r=%d | UTF16: %s| out: %s", in, cp, wl, sl, r, w, o);
+
+        char w[300];
+        char o[300];
+
+        int n = wl;
+
+        if (n < 0) {
+            n = 0;
+
+            while (n < 64 && ws[n])
+                n++;
+
+            n++;
+
+            if (n > 64)
+                n = 64;
+        }
+
+        if (n > 40)
+            n = 40;
+
+        hex_(
+            w,
+            sizeof(w),
+            (const unsigned char *)ws,
+            n * 2
+        );
+
+        /*
+         * 只有 API 回傳成功時才記錄有效輸出長度。
+         * r=0 時不把容量不足的緩衝區內容誤認為完整結果。
+         */
+        if (r > 0 && s && sl > 0) {
+
+            int out_len = r;
+
+            if (out_len > sl)
+                out_len = sl;
+
+            if (out_len > 48)
+                out_len = 48;
+
+            hex_(
+                o,
+                sizeof(o),
+                (const unsigned char *)s,
+                out_len
+            );
+
+        } else {
+            lstrcpynA(
+                o,
+                "<none>",
+                sizeof(o)
+            );
+        }
+
+        logf_(
+            "WCTMB in=%u->cp=%u wl=%d sl=%d r=%d err=%lu | UTF16: %s| out: %s",
+            in,
+            cp,
+            wl,
+            sl,
+            r,
+            (unsigned long)(r == 0 ? api_error : 0),
+            w,
+            o
+        );
     }
+
+    /*
+     * Debug 寫檔不得改變原本 API 的 LastError。
+     */
+    SetLastError(api_error);
+
     return r;
 }
 
-typedef HWND (WINAPI *PFN_CWEA)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
-typedef BOOL (WINAPI *PFN_SWTA)(HWND, LPCSTR);
-static PFN_CWEA real_CWEA; static PFN_SWTA real_SWTA;
-static void log_title_(const char *api, LPCSTR t) {
-    if (!t || (((ULONG_PTR)t) >> 16) == 0) return;           /* NULL 或 atom */
-    int n = lstrlenA(t); char h[400]; hex_(h, sizeof h, (const unsigned char *)t, n > 60 ? 60 : n);
-    logf_("%s title(%d bytes): %s", api, n, h);
+
+/* ---------------- 視窗標題追蹤 ---------------- */
+
+typedef HWND (WINAPI *PFN_CWEA)(
+    DWORD,
+    LPCSTR,
+    LPCSTR,
+    DWORD,
+    int,
+    int,
+    int,
+    int,
+    HWND,
+    HMENU,
+    HINSTANCE,
+    LPVOID
+);
+
+typedef BOOL (WINAPI *PFN_SWTA)(
+    HWND,
+    LPCSTR
+);
+
+static PFN_CWEA real_CWEA;
+static PFN_SWTA real_SWTA;
+
+
+static void log_title_(
+    const char *api,
+    LPCSTR t
+) {
+    if (!t || (((ULONG_PTR)t) >> 16) == 0)
+        return;
+
+    int n = lstrlenA(t);
+
+    char h[400];
+
+    hex_(
+        h,
+        sizeof(h),
+        (const unsigned char *)t,
+        n > 60 ? 60 : n
+    );
+
+    logf_(
+        "%s title(%d bytes): %s",
+        api,
+        n,
+        h
+    );
 }
-static HWND WINAPI My_CWEA(DWORD ex, LPCSTR cls, LPCSTR name, DWORD st, int x, int y, int w, int h, HWND p, HMENU m, HINSTANCE i, LPVOID lp) {
-    if (g_debug >= 2) log_title_("CreateWindowExA", name);
-    return real_CWEA(ex, cls, name, st, x, y, w, h, p, m, i, lp);
+
+
+static HWND WINAPI My_CWEA(
+    DWORD ex,
+    LPCSTR cls,
+    LPCSTR name,
+    DWORD st,
+    int x,
+    int y,
+    int w,
+    int h,
+    HWND p,
+    HMENU m,
+    HINSTANCE i,
+    LPVOID lp
+) {
+    if (g_debug >= 2)
+        log_title_("CreateWindowExA", name);
+
+    return real_CWEA(
+        ex,
+        cls,
+        name,
+        st,
+        x,
+        y,
+        w,
+        h,
+        p,
+        m,
+        i,
+        lp
+    );
 }
-static BOOL WINAPI My_SWTA(HWND h, LPCSTR t) {
-    if (g_debug >= 2) log_title_("SetWindowTextA", t);
+
+
+static BOOL WINAPI My_SWTA(
+    HWND h,
+    LPCSTR t
+) {
+    if (g_debug >= 2)
+        log_title_("SetWindowTextA", t);
+
     return real_SWTA(h, t);
 }
 
-static void hook_module_fonts(HMODULE m) { patch_iat(m, "GDI32.dll", "CreateFontIndirectA", My_CFIA); }
+
+/* ---------------- 動態模組字型 Hook ---------------- */
+
+static void hook_module_fonts(HMODULE m) {
+    patch_iat(
+        m,
+        "GDI32.dll",
+        "CreateFontIndirectA",
+        My_CFIA
+    );
+}
+
 
 static HMODULE WINAPI My_LLA(LPCSTR name) {
+
     HMODULE h = real_LLA(name);
-    if (h) { hook_module_fonts(h); logf_("LoadLibraryA(%s) -> font hook applied", name ? name : "?"); }
+
+    /*
+     * 先保存真正 LoadLibraryA 的 LastError。
+     */
+    DWORD api_error = GetLastError();
+
+    if (h) {
+
+        hook_module_fonts(h);
+
+        if (name) {
+
+            char path_utf8[4096];
+
+            if (ansi_to_utf8(
+                    name,
+                    path_utf8,
+                    sizeof(path_utf8)
+                )) {
+
+                logf_(
+                    "LoadLibraryA(%s) -> font hook applied",
+                    path_utf8
+                );
+
+            } else {
+
+                /*
+                 * 轉換失敗時保留原始位元組 HEX，
+                 * 不將非 UTF-8 ANSI 路徑直接寫入 UTF-8 Log。
+                 */
+                char raw[256];
+
+                int raw_len = lstrlenA(name);
+
+                if (raw_len > 60)
+                    raw_len = 60;
+
+                hex_(
+                    raw,
+                    sizeof(raw),
+                    (const unsigned char *)name,
+                    raw_len
+                );
+
+                logf_(
+                    "LoadLibraryA(<ANSI-to-UTF-8 failed; raw bytes: %s>) -> font hook applied",
+                    raw
+                );
+            }
+
+        } else {
+            logf_(
+                "LoadLibraryA(?) -> font hook applied"
+            );
+        }
+    }
+
+    /*
+     * 字型 IAT 修補及 Debug 寫檔不得改變
+     * 原始 LoadLibraryA 的 LastError。
+     */
+    SetLastError(api_error);
+
     return h;
 }
 
-/* params string16 reader 的包裝。
- * 原返回位址以參數交給 reader_enter，存放在執行緒專屬 FLS 堆疊；不使用共享全域返回位址。
- * 進入 helper 前暫存並還原 EAX/ECX/EDX，保留原 reader 的暫存器參數。
- * FLS 狀態配置失敗或巢狀深度超過上限時，直接 tail-jump 原 reader，保持原始呼叫堆疊。
- * 正常返回時保存並還原 EAX/EDX，ret $8 僅清除 wrapper 暫存的兩個返回暫存器。
+
+/* ---------------- ReaderWrap ---------------- */
+
+/*
+ * params string16 reader 的包裝。
+ *
+ * 原返回位址以參數交給 reader_enter，
+ * 存放在執行緒專屬 FLS 堆疊。
+ *
+ * FLS 配置失敗或巢狀深度超過上限時，
+ * 直接 tail-jump 原 reader。
  */
+
 __asm__(
     ".text\n.globl _ReaderWrap\n_ReaderWrap:\n"
+
     "  pushl %eax\n"
     "  pushl %ecx\n"
     "  pushl %edx\n"
+
     "  movl 12(%esp), %eax\n"
     "  pushl %eax\n"
+
     "  call _reader_enter\n"
+
     "  testl %eax, %eax\n"
     "  jz 1f\n"
+
     "  addl $4, %esp\n"
+
     "  popl %edx\n"
     "  popl %ecx\n"
     "  popl %eax\n"
+
     "  addl $4, %esp\n"
+
     "  call *_g_realReader\n"
+
     "  pushl %edx\n"
     "  pushl %eax\n"
+
     "  call _reader_leave\n"
+
     "  pushl %eax\n"
+
     "  movl 4(%esp), %eax\n"
     "  movl 8(%esp), %edx\n"
+
     "  ret $8\n"
+
     "1:\n"
+
     "  addl $4, %esp\n"
+
     "  popl %edx\n"
     "  popl %ecx\n"
     "  popl %eax\n"
-    "  jmp *_g_realReader\n");
+
+    "  jmp *_g_realReader\n"
+);
+
 extern void ReaderWrap(void);
 
+
+/* ---------------- Reader 呼叫點修補 ---------------- */
+
 static BOOL patch_reader_site(DWORD va) {
-    BYTE *p = (BYTE *)va; DWORD old;
-    if (IsBadReadPtr(p, 5) || p[0] != 0xE8) return FALSE;
-    if ((DWORD)(p + 5 + *(int *)(p + 1)) != g_realReader) return FALSE;
-    if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old)) return FALSE;
-    *(int *)(p + 1) = (int)((BYTE *)ReaderWrap - (p + 5));
-    VirtualProtect(p, 5, old, &old); FlushInstructionCache(GetCurrentProcess(), p, 5);
+
+    BYTE *p = (BYTE *)va;
+
+    DWORD old;
+
+    if (IsBadReadPtr(p, 5) || p[0] != 0xE8)
+        return FALSE;
+
+    if (
+        (DWORD)(p + 5 + *(int *)(p + 1))
+        != g_realReader
+    )
+        return FALSE;
+
+    if (!VirtualProtect(
+            p,
+            5,
+            PAGE_EXECUTE_READWRITE,
+            &old
+        ))
+        return FALSE;
+
+    *(int *)(p + 1) =
+        (int)((BYTE *)ReaderWrap - (p + 5));
+
+    VirtualProtect(p, 5, old, &old);
+
+    FlushInstructionCache(
+        GetCurrentProcess(),
+        p,
+        5
+    );
+
     return TRUE;
 }
 
-static BOOL patch_bytes(DWORD va, const BYTE *expect, const BYTE *repl, int n) {
-    BYTE *p = (BYTE *)va; DWORD old;
-    if (IsBadReadPtr(p, n) || memcmp(p, expect, n)) return FALSE;
-    if (!VirtualProtect(p, n, PAGE_READWRITE, &old)) return FALSE;
-    memcpy(p, repl, n); VirtualProtect(p, n, old, &old); return TRUE;
+
+/* ---------------- GBK 位元組修補 ---------------- */
+
+static BOOL patch_bytes(
+    DWORD va,
+    const BYTE *expect,
+    const BYTE *repl,
+    int n
+) {
+    BYTE *p = (BYTE *)va;
+
+    DWORD old;
+
+    if (IsBadReadPtr(p, n) ||
+        memcmp(p, expect, n))
+        return FALSE;
+
+    if (!VirtualProtect(
+            p,
+            n,
+            PAGE_READWRITE,
+            &old
+        ))
+        return FALSE;
+
+    memcpy(p, repl, n);
+
+    VirtualProtect(p, n, old, &old);
+
+    return TRUE;
 }
+
+
+/* ---------------- INI ---------------- */
+
+static void read_ini(void) {
+
+    char exe[MAX_PATH];
+    char ini[MAX_PATH];
+
+    GetModuleFileNameA(
+        NULL,
+        exe,
+        MAX_PATH
+    );
+
+    char *s = strrchr(exe, '\\');
+
+    if (s)
+        *s = 0;
+
+    wsprintfA(
+        ini,
+        "%s\\ChihanaGBK.ini",
+        exe
+    );
+
+    wsprintfA(
+        g_logpath,
+        "%s\\ChihanaGBK.log",
+        exe
+    );
+
+    g_encoding_enabled =
+        GetPrivateProfileIntA(
+            "Options",
+            "EncodingEnabled",
+            1,
+            ini
+        ) != 0;
+
+    g_debug =
+        GetPrivateProfileIntA(
+            "Options",
+            "Debug",
+            0,
+            ini
+        );
+
+    GetPrivateProfileStringA(
+        "Font",
+        "Face",
+        "SimHei",
+        g_face,
+        LF_FACESIZE,
+        ini
+    );
+
+    g_charset =
+        GetPrivateProfileIntA(
+            "Font",
+            "Charset",
+            134,
+            ini
+        );
+
+    g_weight =
+        GetPrivateProfileIntA(
+            "Font",
+            "Weight",
+            0,
+            ini
+        );
+
+    g_hscale =
+        GetPrivateProfileIntA(
+            "Font",
+            "HeightScale",
+            100,
+            ini
+        );
+
+    if (g_hscale < 10 || g_hscale > 1000)
+        g_hscale = 100;
+}
+
 
 /* ---------------- 初始化 ---------------- */
-static void read_ini(void) {
-    char exe[MAX_PATH], ini[MAX_PATH];
-    GetModuleFileNameA(NULL, exe, MAX_PATH);
-    char *s = strrchr(exe, '\\'); if (s) *s = 0;
-    wsprintfA(ini, "%s\\ChihanaGBK.ini", exe); wsprintfA(g_logpath, "%s\\ChihanaGBK.log", exe);
-    g_encoding_enabled = GetPrivateProfileIntA("Options", "EncodingEnabled", 1, ini) != 0;
-    g_debug   = GetPrivateProfileIntA("Options", "Debug", 0, ini);
-    GetPrivateProfileStringA("Font", "Face", "SimHei", g_face, LF_FACESIZE, ini);
-    g_charset = GetPrivateProfileIntA("Font", "Charset", 134, ini);
-    g_weight  = GetPrivateProfileIntA("Font", "Weight", 0, ini);
-    g_hscale  = GetPrivateProfileIntA("Font", "HeightScale", 100, ini);
-    if (g_hscale < 10 || g_hscale > 1000) g_hscale = 100;
-}
 
 static void init(void) {
+
     read_ini();
-    logf_("== ChihanaGBK %s (%s) init, exe base %p, encoding=%s, face=%s charset=%d weight=%d hscale=%d", CHIHANA_VER_STR, CHIHANA_BUILD_DATE, GetModuleHandleA(NULL), g_encoding_enabled ? "ON" : "OFF", g_face, g_charset, g_weight, g_hscale);
-    HMODULE exe = GetModuleHandleA(NULL);
-    HMODULE gdi = GetModuleHandleA("gdi32.dll"), k32 = GetModuleHandleA("kernel32.dll");
-    real_CFIA = (PFN_CFIA)GetProcAddress(gdi, "CreateFontIndirectA");
-    real_WCTMB = (PFN_WCTMB)GetProcAddress(k32, "WideCharToMultiByte");
-    real_LLA = (PFN_LLA)GetProcAddress(k32, "LoadLibraryA");
-    logf_("exe IAT: CreateFontIndirectA=%d WideCharToMultiByte=%d LoadLibraryA=%d",
-          real_CFIA ? patch_iat(exe, "GDI32.dll", "CreateFontIndirectA", My_CFIA) : 0,
-          (g_encoding_enabled && real_WCTMB) ? patch_iat(exe, "KERNEL32.dll", "WideCharToMultiByte", My_WCTMB) : 0,
-          real_LLA ? patch_iat(exe, "KERNEL32.dll", "LoadLibraryA", My_LLA) : 0);
-    if (!g_encoding_enabled)
-        logf_("EncodingEnabled=0: original text behavior; no encoding or text-trace hooks; font hooks remain enabled");
-    if (g_encoding_enabled && g_debug >= 2) {
-        HMODULE u32 = GetModuleHandleA("user32.dll");
-        real_CWEA = (PFN_CWEA)GetProcAddress(u32, "CreateWindowExA"); real_SWTA = (PFN_SWTA)GetProcAddress(u32, "SetWindowTextA");
-        logf_("trace: CreateWindowExA=%d SetWindowTextA=%d",
-              real_CWEA ? patch_iat(exe, "USER32.dll", "CreateWindowExA", My_CWEA) : 0,
-              real_SWTA ? patch_iat(exe, "USER32.dll", "SetWindowTextA", My_SWTA) : 0);
+
+    /*
+     * Face 轉成 UTF-8 後才寫入 Log。
+     */
+    char face_utf8[LF_FACESIZE * 4];
+
+    if (!ansi_to_utf8(
+            g_face,
+            face_utf8,
+            sizeof(face_utf8)
+        )) {
+
+        lstrcpynA(
+            face_utf8,
+            "<ANSI-to-UTF-8 failed>",
+            sizeof(face_utf8)
+        );
     }
+
+    logf_(
+        "== ChihanaGBK %s (%s) init, exe base %p, encoding=%s, face=%s charset=%d weight=%d hscale=%d",
+        CHIHANA_VER_STR,
+        CHIHANA_BUILD_DATE,
+        GetModuleHandleA(NULL),
+        g_encoding_enabled ? "ON" : "OFF",
+        face_utf8,
+        g_charset,
+        g_weight,
+        g_hscale
+    );
+
+    HMODULE exe = GetModuleHandleA(NULL);
+
+    HMODULE gdi =
+        GetModuleHandleA("gdi32.dll");
+
+    HMODULE k32 =
+        GetModuleHandleA("kernel32.dll");
+
+    real_CFIA =
+        (PFN_CFIA)GetProcAddress(
+            gdi,
+            "CreateFontIndirectA"
+        );
+
+    real_WCTMB =
+        (PFN_WCTMB)GetProcAddress(
+            k32,
+            "WideCharToMultiByte"
+        );
+
+    real_LLA =
+        (PFN_LLA)GetProcAddress(
+            k32,
+            "LoadLibraryA"
+        );
+
+    logf_(
+        "exe IAT: CreateFontIndirectA=%d WideCharToMultiByte=%d LoadLibraryA=%d",
+
+        real_CFIA
+            ? patch_iat(
+                exe,
+                "GDI32.dll",
+                "CreateFontIndirectA",
+                My_CFIA
+            )
+            : 0,
+
+        (g_encoding_enabled && real_WCTMB)
+            ? patch_iat(
+                exe,
+                "KERNEL32.dll",
+                "WideCharToMultiByte",
+                My_WCTMB
+            )
+            : 0,
+
+        real_LLA
+            ? patch_iat(
+                exe,
+                "KERNEL32.dll",
+                "LoadLibraryA",
+                My_LLA
+            )
+            : 0
+    );
+
+
+    if (!g_encoding_enabled) {
+
+        logf_(
+            "EncodingEnabled=0: original text behavior; no encoding or text-trace hooks; font hooks remain enabled"
+        );
+    }
+
+
+    /* ---------------- Debug 視窗標題追蹤 ---------------- */
+
+    if (g_encoding_enabled && g_debug >= 2) {
+
+        HMODULE u32 =
+            GetModuleHandleA("user32.dll");
+
+        real_CWEA =
+            (PFN_CWEA)GetProcAddress(
+                u32,
+                "CreateWindowExA"
+            );
+
+        real_SWTA =
+            (PFN_SWTA)GetProcAddress(
+                u32,
+                "SetWindowTextA"
+            );
+
+        logf_(
+            "trace: CreateWindowExA=%d SetWindowTextA=%d",
+
+            real_CWEA
+                ? patch_iat(
+                    exe,
+                    "USER32.dll",
+                    "CreateWindowExA",
+                    My_CWEA
+                )
+                : 0,
+
+            real_SWTA
+                ? patch_iat(
+                    exe,
+                    "USER32.dll",
+                    "SetWindowTextA",
+                    My_SWTA
+                )
+                : 0
+        );
+    }
+
+
+    /* ---------------- GBK 編碼模式 ---------------- */
+
     if (g_encoding_enabled) {
-        /* params 讀取點 / 標點：自動掃描 exe 映像。掃描器維持原版，不改動 5.7 / 5.8 已驗證簽章。 */
-        KScan sc; int found = ks_scan((const BYTE *)exe, (DWORD)exe, &sc);
-        int ok = 0, extra = 0, br = 0;
+
+        /*
+         * params 讀取點 / 標點：
+         * 自動掃描 exe 映像。
+         *
+         * kaguya_scan.h 不修改。
+         */
+        KScan sc;
+
+        int found = ks_scan(
+            (const BYTE *)exe,
+            (DWORD)exe,
+            &sc
+        );
+
+        int ok = 0;
+        int extra = 0;
+        int br = 0;
+
         if (found) {
-            g_realReader = (DWORD)exe + sc.reader;
-            g_readerFls = FlsAlloc(reader_state_cleanup);
+
+            g_realReader =
+                (DWORD)exe + sc.reader;
+
+            g_readerFls =
+                FlsAlloc(reader_state_cleanup);
+
             if (g_readerFls != FLS_OUT_OF_INDEXES) {
-                /* 恢復 v2.4.0 已驗證的五個 params 欄位 CP936 行為。 */
-                for (int i = 0; i < 5; i++) if (sc.site[i]) ok += patch_reader_site((DWORD)exe + sc.site[i]);
+
+                /*
+                 * 保留五個自動 params 欄位。
+                 */
+                for (int i = 0; i < 5; i++) {
+                    if (sc.site[i]) {
+                        ok += patch_reader_site(
+                            (DWORD)exe + sc.site[i]
+                        );
+                    }
+                }
+
             } else {
-                logf_("FLS allocation failed: ReaderWrap hook skipped; other patches remain enabled");
+
+                logf_(
+                    "FLS allocation failed: ReaderWrap hook skipped; other patches remain enabled"
+                );
             }
-            static const BYTE e1[] = {0x81,0x7A}, r1[] = {0xA1,0xBF}, e2[] = {0x81,0x79}, r2[] = {0xA1,0xBE};
-            for (int i = 0; i < sc.n_close; i++) br += patch_bytes((DWORD)exe + sc.br_close[i], e1, r1, 2);
-            for (int i = 0; i < sc.n_open;  i++) br += patch_bytes((DWORD)exe + sc.br_open[i],  e2, r2, 2);
-            /* 全形空白：視窗標題 = GameTitle +「　」+ DisplayTitle；保留原版 GBK 碼修補 */
-            static const BYTE e3[] = {0x81,0x40}, r3[] = {0xA1,0xA1}, e4[] = {0x20,0x81,0x40}, r4[] = {0x20,0xA1,0xA1};
-            for (int i = 0; i < sc.n_sp1; i++) br += patch_bytes((DWORD)exe + sc.sp1[i], e3, r3, 2);
-            for (int i = 0; i < sc.n_sp2; i++) br += patch_bytes((DWORD)exe + sc.sp2[i], e4, r4, 3);
-            logf_("掃描成功: reader=%p (呼叫者 %d), 欄位 %d/5, ReaderWrap CP936 欄位 %d/5, FLS=%s, 】【 %d+%d, 全形空白 %d+%d",
-                  (void *)g_realReader, sc.reader_callers, sc.nsite, ok,
-                  g_readerFls != FLS_OUT_OF_INDEXES ? "OK" : "FAILED",
-                  sc.n_close, sc.n_open, sc.n_sp1, sc.n_sp2);
-        } else logf_("掃描不到 params reader（可能不是此引擎版本）：略過標題/括號修補");
-        /* 手動補充：ini [Params] ExtraSites=0x...,0x...（reader 呼叫位址；明確設定時額外套用 CP936） */
-        if (found && g_readerFls != FLS_OUT_OF_INDEXES) {
-            char ini[MAX_PATH], exep[MAX_PATH]; GetModuleFileNameA(NULL, exep, MAX_PATH); char *s2 = strrchr(exep, '\\'); if (s2) *s2 = 0;
-            wsprintfA(ini, "%s\\ChihanaGBK.ini", exep);
-            char list[256]; GetPrivateProfileStringA("Params", "ExtraSites", "", list, sizeof list, ini);
-            for (char *t = strtok(list, ", "); t; t = strtok(NULL, ", ")) extra += patch_reader_site((DWORD)strtoul(t, NULL, 0));
+
+
+            /* 】 */
+            static const BYTE e1[] = {
+                0x81, 0x7A
+            };
+
+            static const BYTE r1[] = {
+                0xA1, 0xBF
+            };
+
+
+            /* 【 */
+            static const BYTE e2[] = {
+                0x81, 0x79
+            };
+
+            static const BYTE r2[] = {
+                0xA1, 0xBE
+            };
+
+
+            for (int i = 0; i < sc.n_close; i++) {
+
+                br += patch_bytes(
+                    (DWORD)exe + sc.br_close[i],
+                    e1,
+                    r1,
+                    2
+                );
+            }
+
+
+            for (int i = 0; i < sc.n_open; i++) {
+
+                br += patch_bytes(
+                    (DWORD)exe + sc.br_open[i],
+                    e2,
+                    r2,
+                    2
+                );
+            }
+
+
+            /* 全形空白 */
+            static const BYTE e3[] = {
+                0x81, 0x40
+            };
+
+            static const BYTE r3[] = {
+                0xA1, 0xA1
+            };
+
+
+            /* 半形空白 + 全形空白 */
+            static const BYTE e4[] = {
+                0x20, 0x81, 0x40
+            };
+
+            static const BYTE r4[] = {
+                0x20, 0xA1, 0xA1
+            };
+
+
+            for (int i = 0; i < sc.n_sp1; i++) {
+
+                br += patch_bytes(
+                    (DWORD)exe + sc.sp1[i],
+                    e3,
+                    r3,
+                    2
+                );
+            }
+
+
+            for (int i = 0; i < sc.n_sp2; i++) {
+
+                br += patch_bytes(
+                    (DWORD)exe + sc.sp2[i],
+                    e4,
+                    r4,
+                    3
+                );
+            }
+
+
+            logf_(
+                "掃描成功: reader=%p (呼叫者 %d), 欄位 %d/5, ReaderWrap CP936 欄位 %d/5, FLS=%s, 】【 %d+%d, 全形空白 %d+%d",
+
+                (void *)g_realReader,
+                sc.reader_callers,
+                sc.nsite,
+                ok,
+
+                g_readerFls != FLS_OUT_OF_INDEXES
+                    ? "OK"
+                    : "FAILED",
+
+                sc.n_close,
+                sc.n_open,
+                sc.n_sp1,
+                sc.n_sp2
+            );
+
+        } else {
+
+            logf_(
+                "掃描不到 params reader（可能不是此引擎版本）：略過標題/括號修補"
+            );
         }
-        logf_("params CP936 hook: 五個自動欄位=%d/5；ExtraSites=%d；標點(】【全形空白): %d 處", ok, extra, br);
+
+
+        /*
+         * ExtraSites
+         */
+        if (
+            found &&
+            g_readerFls != FLS_OUT_OF_INDEXES
+        ) {
+
+            char ini[MAX_PATH];
+            char exep[MAX_PATH];
+
+            GetModuleFileNameA(
+                NULL,
+                exep,
+                MAX_PATH
+            );
+
+            char *s2 = strrchr(exep, '\\');
+
+            if (s2)
+                *s2 = 0;
+
+            wsprintfA(
+                ini,
+                "%s\\ChihanaGBK.ini",
+                exep
+            );
+
+            char list[256];
+
+            GetPrivateProfileStringA(
+                "Params",
+                "ExtraSites",
+                "",
+                list,
+                sizeof(list),
+                ini
+            );
+
+            for (
+                char *t = strtok(list, ", ");
+                t;
+                t = strtok(NULL, ", ")
+            ) {
+
+                extra += patch_reader_site(
+                    (DWORD)strtoul(t, NULL, 0)
+                );
+            }
+        }
+
+
+        logf_(
+            "params CP936 hook: 五個自動欄位=%d/5；ExtraSites=%d；標點(】【全形空白): %d 處",
+            ok,
+            extra,
+            br
+        );
+
     } else {
-        /* 原版文字模式：不掃描、不掛 ReaderWrap、不套用 ExtraSites，也不修改 GBK 文字位元組。 */
-        logf_("EncodingEnabled=0: skipped text conversion hook, params scan, ReaderWrap/ExtraSites and GBK byte patches; font hooks remain enabled");
+
+        /*
+         * 原版文字模式：
+         * 不掃描、不掛 ReaderWrap、不套用 ExtraSites，
+         * 也不修改 GBK 文字位元組。
+         */
+        logf_(
+            "EncodingEnabled=0: skipped text conversion hook, params scan, ReaderWrap/ExtraSites and GBK byte patches; font hooks remain enabled"
+        );
     }
 }
 
-/* InitOnce 確保多執行緒首次呼叫代理 API 時，只初始化一次。此處已離開本 DLL 的 DllMain。 */
-static INIT_ONCE g_initOnce = INIT_ONCE_STATIC_INIT;
 
-static BOOL CALLBACK initialize_once(PINIT_ONCE once, PVOID parameter, PVOID *context) {
+/* ---------------- InitOnce ---------------- */
+
+static INIT_ONCE g_initOnce =
+    INIT_ONCE_STATIC_INIT;
+
+
+static BOOL CALLBACK initialize_once(
+    PINIT_ONCE once,
+    PVOID parameter,
+    PVOID *context
+) {
     (void)once;
     (void)parameter;
     (void)context;
+
     load_real_version();
+
     init();
+
     return TRUE;
 }
 
+
 static BOOL ensure_initialized(void) {
-    return InitOnceExecuteOnce(&g_initOnce, initialize_once, NULL, NULL);
+
+    return InitOnceExecuteOnce(
+        &g_initOnce,
+        initialize_once,
+        NULL,
+        NULL
+    );
 }
 
-/* DllMain 僅做必要通知設定；系統 version.dll 載入、INI、掃描及記憶體修補全部延後。 */
-BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
+
+/* ---------------- DllMain ---------------- */
+
+BOOL WINAPI DllMain(
+    HINSTANCE h,
+    DWORD reason,
+    LPVOID reserved
+) {
     (void)reserved;
-    if (reason == DLL_PROCESS_ATTACH) DisableThreadLibraryCalls(h);
+
+    if (reason == DLL_PROCESS_ATTACH)
+        DisableThreadLibraryCalls(h);
+
     return TRUE;
 }
