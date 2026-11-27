@@ -9,3 +9,7 @@
 已驗證遊戲：A000（params v5.8）、B000/4328（v5.7）、h000/Hakoniwa（v5.8 新編譯器）。
 
 需要 日版exe 匯入 VERSION.dll。
+
+# 使用方法：
+## 將 version.dll 和 ChihanaGBK.ini 放在遊戲 Start.exe 同一個資料夾即可。
+### 依照需求修改 `ini`
