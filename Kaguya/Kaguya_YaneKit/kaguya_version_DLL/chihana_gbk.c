@@ -1,15 +1,18 @@
 /* chihana_gbk.c -- version.dll 代理 DLL：讓 Kaguya 遊戲在簡中區域(ACP 936)下正確顯示指定 GBK 欄位
  *
- * ChihanaGBK v2.4.2.0
+ * ChihanaGBK v2.4.2.1
  *
- * 本版本以 v2.4.1.9 為基礎，只增加 WCTMB 目的緩衝區診斷：
- *   1. 保留容量查詢與實際轉換的配對資訊。
- *   2. Debug=2 時，擷取 WCTMB 呼叫前後的目的緩衝區內容。
- *   3. 最多讀取 96 bytes，且不超過呼叫端提供的 sl；不寫入目的緩衝區。
+ * 本版本修正 ReaderWrap 內 CP936 的 WCTMB 容量差 1 byte：
+ *   1. Query/Convert 配對不再依賴 Debug 設定。
+ *   2. 配對狀態依執行緒及 ReaderWrap 巢狀層級隔離。
+ *   3. 僅在參數完全相符、CP936、wl=-1、need=sl+1 時增加 1 byte。
+ *   4. 其他 WCTMB 呼叫維持原始容量及參數。
+ *   5. Debug=2 的目的緩衝區快照仍只讀取原始 sl 範圍，不修改緩衝區。
  *
  * 保留：CP936 / CP932 路由、五個 params ReaderWrap、FLS、
  * GBK 標點及全形空白修補、字型 Hook、UTF-8 Log 與 LastError 保護。
  */
+
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0600
 #endif
@@ -38,20 +41,26 @@ static DWORD g_exe_size = 0;
 
 #define READER_MAX_DEPTH 128
 
+/*
+ * 每個 ReaderWrap 層級各自保存一筆 WCTMB Query。
+ * FLS 隔離不同執行緒，陣列索引隔離巢狀 ReaderWrap。
+ */
+typedef struct {
+    LPCWSTR text;
+    LPCSTR defaultChar;
+    LPBOOL usedDefaultChar;
+    UINT codePage;
+    DWORD flags;
+    int wideLen;
+    int required;
+    DWORD callerRva;
+    BOOL valid;
+} WCTMBQueryState;
+
 typedef struct {
     DWORD depth;
     DWORD returnAddress[READER_MAX_DEPTH];
-
-    /* Debug-only：配對 WCTMB 的需求容量查詢與下一次實際轉換。 */
-    LPCWSTR wctmbQueryText;
-    LPCSTR wctmbQueryDefaultChar;
-    LPBOOL wctmbQueryUsedDefaultChar;
-    UINT wctmbQueryCodePage;
-    DWORD wctmbQueryFlags;
-    int wctmbQueryWideLen;
-    int wctmbQueryRequired;
-    DWORD wctmbQueryCallerRva;
-    BOOL wctmbQueryValid;
+    WCTMBQueryState wctmbQuery[READER_MAX_DEPTH];
 } ReaderThreadState;
 
 static DWORD g_readerFls = FLS_OUT_OF_INDEXES;
@@ -454,7 +463,7 @@ static void hex_(
 /*
  * 僅供 Debug=2 診斷使用。
  * 透過 ReadProcessMemory 讀取目前程序的目的緩衝區，避免直接解參考
- * 無效位址；讀取長度不超過呼叫端提供的 capacity，也不超過本地快照容量。
+ * 無效位址；讀取長度不超過呼叫端原始提供的 sl，也不超過本地快照容量。
  * 保留呼叫前的 LastError，避免診斷讀取影響後續 WCTMB。
  */
 #define WCTMB_DIAG_CAPTURE_MAX 96
@@ -476,6 +485,7 @@ static BOOL snapshot_output_buffer(
 
     if (source && capacity > 0 && buffer && buffer_capacity > 0) {
         request = (SIZE_T)capacity;
+
         if (request > buffer_capacity)
             request = buffer_capacity;
 
@@ -492,6 +502,7 @@ static BOOL snapshot_output_buffer(
     }
 
     SetLastError(saved_error);
+
     return ok && got == request;
 }
 
@@ -628,12 +639,20 @@ reader_enter(DWORD return_address) {
     BOOL ok = FALSE;
 
     if (state && state->depth < READER_MAX_DEPTH) {
-        /* 不讓上一層 ReaderWrap 遺留的查詢資料跨範圍配對。 */
-        if (state->depth == 0)
-            state->wctmbQueryValid = FALSE;
+        DWORD index = state->depth;
 
-        state->returnAddress[state->depth++] =
-            return_address;
+        /*
+         * 新 ReaderWrap 層級先清空自己的查詢槽。
+         * 不沿用前一次 ReaderWrap 留下的配對資料。
+         */
+        memset(
+            &state->wctmbQuery[index],
+            0,
+            sizeof(state->wctmbQuery[index])
+        );
+
+        state->returnAddress[index] = return_address;
+        state->depth = index + 1;
 
         ok = TRUE;
     }
@@ -655,12 +674,22 @@ reader_leave(void) {
     DWORD return_address = 0;
 
     if (state && state->depth != 0) {
-        return_address =
-            state->returnAddress[--state->depth];
+        DWORD index = state->depth - 1;
 
-        /* 查詢配對只允許存在於同一個 ReaderWrap 範圍。 */
-        if (state->depth == 0)
-            state->wctmbQueryValid = FALSE;
+        return_address =
+            state->returnAddress[index];
+
+        /*
+         * 離開本層 ReaderWrap 時清除本層查詢紀錄。
+         * 不清除父層資料，避免巢狀 ReaderWrap 互相干擾。
+         */
+        memset(
+            &state->wctmbQuery[index],
+            0,
+            sizeof(state->wctmbQuery[index])
+        );
+
+        state->depth = index;
     }
 
     SetLastError(saved);
@@ -696,46 +725,204 @@ static int WINAPI My_WCTMB(
     LPBOOL ud
 ) {
     UINT in = cp;
+
     BOOL in_reader = reader_active();
 
-    DWORD caller = (DWORD)(ULONG_PTR)__builtin_return_address(0);
-    DWORD caller_rva = exe_rva_from_address(caller);
+    DWORD caller =
+        (DWORD)(ULONG_PTR)__builtin_return_address(0);
+
+    DWORD caller_rva =
+        exe_rva_from_address(caller);
 
     /* ReaderWrap 內固定 CP936；範圍外維持 CP932。 */
     if (cp == CP_THREAD_ACP)
         cp = in_reader ? 936 : 932;
 
+    BOOL is_query =
+        (s == NULL && sl == 0);
+
     /*
-     * 僅在 Debug=2、ReaderWrap 範圍內追蹤目的緩衝區。
-     * 快照只讀取 min(sl, 96) bytes，絕不修改遊戲緩衝區。
+     * Query/Convert 配對屬於實際執行邏輯，不依賴 Debug。
+     *
+     * FLS 隔離不同執行緒。
+     * wctmbQuery[depth-1] 隔離目前 ReaderWrap 巢狀層級。
+     */
+    DWORD error_before_state = GetLastError();
+
+    ReaderThreadState *state = NULL;
+    WCTMBQueryState *query_state = NULL;
+
+    if (in_reader) {
+        state = reader_state_get(FALSE);
+
+        if (state &&
+            state->depth != 0 &&
+            state->depth <= READER_MAX_DEPTH) {
+
+            query_state =
+                &state->wctmbQuery[state->depth - 1];
+        }
+    }
+
+    int api_sl = sl;
+
+    BOOL paired = FALSE;
+    BOOL fix_plus1 = FALSE;
+
+    int paired_required = -1;
+    int capacity_gap = -1;
+
+    DWORD query_caller_rva = 0xFFFFFFFFUL;
+
+    if (query_state) {
+
+        if (is_query) {
+
+            /*
+             * 新 Query 覆蓋本層舊 Query。
+             * API 成功後才會重新建立有效紀錄。
+             */
+            query_state->valid = FALSE;
+
+        } else {
+
+            /*
+             * 下一次非 Query 呼叫會消耗本層查詢。
+             * 所有參數完全相符才視為有效配對。
+             */
+            if (query_state->valid &&
+                query_state->text == ws &&
+                query_state->defaultChar == dc &&
+                query_state->usedDefaultChar == ud &&
+                query_state->codePage == cp &&
+                query_state->flags == fl &&
+                query_state->wideLen == wl) {
+
+                paired = TRUE;
+
+                paired_required =
+                    query_state->required;
+
+                query_caller_rva =
+                    query_state->callerRva;
+
+                if (paired_required >= 0 && sl >= 0)
+                    capacity_gap = paired_required - sl;
+
+                /*
+                 * 條件式 +1：
+                 *
+                 * 1. 位於 ReaderWrap。
+                 * 2. Query/Convert 已配對。
+                 * 3. Query/Convert 參數完全相同。
+                 * 4. CP936。
+                 * 5. cchWideChar = -1。
+                 * 6. Query need 恰好比 sl 多 1 byte。
+                 *
+                 * 使用 Query 回傳的實際需求容量，不自行計算 sl+1。
+                 */
+                if (s != NULL &&
+                    cp == 936 &&
+                    wl == -1 &&
+                    sl >= 0 &&
+                    paired_required > sl &&
+                    paired_required - sl == 1) {
+
+                    api_sl = paired_required;
+                    fix_plus1 = TRUE;
+                }
+            }
+
+            /*
+             * 不論配對成功與否，本次非 Query 呼叫都消耗紀錄，
+             * 避免舊 Query 被後續無關呼叫誤用。
+             */
+            query_state->valid = FALSE;
+        }
+    }
+
+    /*
+     * FLS 狀態查詢不得改變真正 WCTMB 呼叫所看到的 LastError。
+     */
+    SetLastError(error_before_state);
+
+    /*
+     * 僅在 Debug=2、ReaderWrap 範圍內擷取目的緩衝區。
+     *
+     * 快照嚴格限制在呼叫端原始 sl 範圍：
+     * 不讀取額外增加的 1 byte，也不修改遊戲緩衝區。
      */
     BOOL capture_destination =
         (g_debug >= 2 && in_reader && ws && s && sl > 0);
 
     BYTE destination_before[WCTMB_DIAG_CAPTURE_MAX];
+
     SIZE_T destination_before_read = 0;
+
     BOOL destination_before_ok = FALSE;
 
     if (capture_destination) {
-        memset(destination_before, 0, sizeof(destination_before));
-        destination_before_ok = snapshot_output_buffer(
-            s, sl, destination_before, sizeof(destination_before),
-            &destination_before_read
+        memset(
+            destination_before,
+            0,
+            sizeof(destination_before)
         );
+
+        destination_before_ok =
+            snapshot_output_buffer(
+                s,
+                sl,
+                destination_before,
+                sizeof(destination_before),
+                &destination_before_read
+            );
     }
 
+    /*
+     * 只有符合條件的呼叫使用 api_sl。
+     * 其餘呼叫仍使用原始 sl。
+     */
     int r = real_WCTMB(
         cp,
         fl,
         ws,
         wl,
         s,
-        sl,
+        api_sl,
         dc,
         ud
     );
 
     DWORD api_error = GetLastError();
+
+    /*
+     * 成功的 Query 才建立配對資料。
+     * Query 本身的原始 API 參數、回傳值與 LastError 不變。
+     */
+    if (is_query && query_state) {
+
+        if (r > 0) {
+
+            query_state->text = ws;
+            query_state->defaultChar = dc;
+            query_state->usedDefaultChar = ud;
+            query_state->codePage = cp;
+            query_state->flags = fl;
+            query_state->wideLen = wl;
+            query_state->required = r;
+            query_state->callerRva = caller_rva;
+            query_state->valid = TRUE;
+
+            paired_required = r;
+            query_caller_rva = caller_rva;
+
+        } else {
+
+            query_state->valid = FALSE;
+        }
+    }
+
+    /* ---------------- Debug 診斷 ---------------- */
 
     if (g_debug >= 2 && in_reader && ws) {
 
@@ -743,46 +930,99 @@ static int WINAPI My_WCTMB(
         char o[300];
 
         BYTE destination_after[WCTMB_DIAG_CAPTURE_MAX];
+
         SIZE_T destination_after_read = 0;
+
         BOOL destination_after_ok = FALSE;
+
         SIZE_T destination_snapshot_request = 0;
+
         int destination_changed = -1;
+
         char destination_before_hex[300] = "<skip>";
         char destination_after_hex[300] = "<skip>";
 
         if (capture_destination) {
-            memset(destination_after, 0, sizeof(destination_after));
-            destination_snapshot_request = (SIZE_T)sl;
-            if (destination_snapshot_request > WCTMB_DIAG_CAPTURE_MAX)
-                destination_snapshot_request = WCTMB_DIAG_CAPTURE_MAX;
 
-            destination_after_ok = snapshot_output_buffer(
-                s, sl, destination_after, sizeof(destination_after),
-                &destination_after_read
+            memset(
+                destination_after,
+                0,
+                sizeof(destination_after)
             );
 
-            if (destination_before_read > 0)
-                hex_(destination_before_hex, sizeof(destination_before_hex),
-                     destination_before, (int)destination_before_read);
-            else
-                lstrcpynA(destination_before_hex, "<unreadable>",
-                          sizeof(destination_before_hex));
+            destination_snapshot_request =
+                (SIZE_T)sl;
 
-            if (destination_after_read > 0)
-                hex_(destination_after_hex, sizeof(destination_after_hex),
-                     destination_after, (int)destination_after_read);
-            else
-                lstrcpynA(destination_after_hex, "<unreadable>",
-                          sizeof(destination_after_hex));
+            if (destination_snapshot_request >
+                WCTMB_DIAG_CAPTURE_MAX) {
 
-            if (destination_before_read > 0 && destination_after_read > 0) {
+                destination_snapshot_request =
+                    WCTMB_DIAG_CAPTURE_MAX;
+            }
+
+            destination_after_ok =
+                snapshot_output_buffer(
+                    s,
+                    sl,
+                    destination_after,
+                    sizeof(destination_after),
+                    &destination_after_read
+                );
+
+            if (destination_before_read > 0) {
+
+                hex_(
+                    destination_before_hex,
+                    sizeof(destination_before_hex),
+                    destination_before,
+                    (int)destination_before_read
+                );
+
+            } else {
+
+                lstrcpynA(
+                    destination_before_hex,
+                    "<unreadable>",
+                    sizeof(destination_before_hex)
+                );
+            }
+
+            if (destination_after_read > 0) {
+
+                hex_(
+                    destination_after_hex,
+                    sizeof(destination_after_hex),
+                    destination_after,
+                    (int)destination_after_read
+                );
+
+            } else {
+
+                lstrcpynA(
+                    destination_after_hex,
+                    "<unreadable>",
+                    sizeof(destination_after_hex)
+                );
+            }
+
+            if (destination_before_read > 0 &&
+                destination_after_read > 0) {
+
                 SIZE_T compare_count =
-                    destination_before_read < destination_after_read
-                    ? destination_before_read : destination_after_read;
+                    destination_before_read <
+                    destination_after_read
+                    ? destination_before_read
+                    : destination_after_read;
+
                 destination_changed = 0;
+
                 for (SIZE_T i = 0; i < compare_count; i++) {
-                    if (destination_before[i] != destination_after[i])
+
+                    if (destination_before[i] !=
+                        destination_after[i]) {
+
                         destination_changed++;
+                    }
                 }
             }
         }
@@ -790,6 +1030,7 @@ static int WINAPI My_WCTMB(
         int n = wl;
 
         if (n < 0) {
+
             n = 0;
 
             while (n < 64 && ws[n])
@@ -811,60 +1052,10 @@ static int WINAPI My_WCTMB(
             n * 2
         );
 
-        BOOL is_query = (s == NULL && sl == 0);
-        BOOL paired = FALSE;
-        int paired_required = -1;
-        int capacity_gap = -1;
-        DWORD query_caller_rva = 0xFFFFFFFFUL;
-
-        ReaderThreadState *state =
-            reader_state_get(FALSE);
-
-        if (state) {
-
-            if (is_query) {
-
-                /* 只保存成功查詢，供同執行緒下一次實際轉換配對。 */
-                state->wctmbQueryValid = (r > 0);
-
-                if (r > 0) {
-                    paired_required = r;
-                    query_caller_rva = caller_rva;
-
-                    state->wctmbQueryText = ws;
-                    state->wctmbQueryDefaultChar = dc;
-                    state->wctmbQueryUsedDefaultChar = ud;
-                    state->wctmbQueryCodePage = cp;
-                    state->wctmbQueryFlags = fl;
-                    state->wctmbQueryWideLen = wl;
-                    state->wctmbQueryRequired = r;
-                    state->wctmbQueryCallerRva = caller_rva;
-                }
-
-            } else {
-
-                /* 參數完全相符才配對；每次實際轉換後消耗查詢紀錄。 */
-                if (state->wctmbQueryValid &&
-                    state->wctmbQueryText == ws &&
-                    state->wctmbQueryDefaultChar == dc &&
-                    state->wctmbQueryUsedDefaultChar == ud &&
-                    state->wctmbQueryCodePage == cp &&
-                    state->wctmbQueryFlags == fl &&
-                    state->wctmbQueryWideLen == wl) {
-
-                    paired = TRUE;
-                    paired_required = state->wctmbQueryRequired;
-                    query_caller_rva = state->wctmbQueryCallerRva;
-
-                    if (paired_required >= 0 && sl >= 0)
-                        capacity_gap = paired_required - sl;
-                }
-
-                state->wctmbQueryValid = FALSE;
-            }
-        }
-
-        /* 只有 API 成功時才記錄轉換結果，避免將未定義資料誤判為輸出。 */
+        /*
+         * 只在 API 成功時記錄輸出。
+         * 輸出診斷仍限制在原始 sl 範圍，不額外讀取第 sl byte。
+         */
         if (r > 0 && s && sl > 0) {
 
             int out_len = r;
@@ -883,6 +1074,7 @@ static int WINAPI My_WCTMB(
             );
 
         } else {
+
             lstrcpynA(
                 o,
                 "<none>",
@@ -891,36 +1083,51 @@ static int WINAPI My_WCTMB(
         }
 
         logf_(
-            "WCTMB kind=%s caller=%08lX rva=%08lX query_rva=%08lX paired=%d need=%d sl=%d gap=%d in=%u->cp=%u wl=%d r=%d err=%lu src=%p dst=%p dst_req=%lu pre_read=%lu pre_ok=%d pre=%s post_read=%lu post_ok=%d post=%s changed=%d | UTF16: %s| out: %s",
+            "WCTMB kind=%s caller=%08lX rva=%08lX query_rva=%08lX paired=%d need=%d sl=%d api_sl=%d fix_plus1=%d gap=%d in=%u->cp=%u wl=%d r=%d err=%lu src=%p dst=%p dst_req=%lu pre_read=%lu pre_ok=%d pre=%s post_read=%lu post_ok=%d post=%s changed=%d | UTF16: %s| out: %s",
+
             is_query ? "QUERY" : (s ? "CONVERT" : "OTHER"),
+
             (unsigned long)caller,
             (unsigned long)caller_rva,
             (unsigned long)query_caller_rva,
+
             paired,
             paired_required,
             sl,
+            api_sl,
+            fix_plus1,
             capacity_gap,
+
             in,
             cp,
             wl,
             r,
+
             (unsigned long)(r == 0 ? api_error : 0),
+
             (const void *)ws,
             (void *)s,
+
             (unsigned long)destination_snapshot_request,
+
             (unsigned long)destination_before_read,
             destination_before_ok,
             destination_before_hex,
+
             (unsigned long)destination_after_read,
             destination_after_ok,
             destination_after_hex,
+
             destination_changed,
+
             w,
             o
         );
     }
 
-    /* Debug 診斷不得改變原本 API 的 LastError。 */
+    /*
+     * Debug 診斷與內部配對不得改變真正 WCTMB 回傳後的 LastError。
+     */
     SetLastError(api_error);
 
     return r;
@@ -1079,6 +1286,7 @@ static HMODULE WINAPI My_LLA(LPCSTR name) {
             }
 
         } else {
+
             logf_(
                 "LoadLibraryA(?) -> font hook applied"
             );
@@ -1318,6 +1526,7 @@ static void init(void) {
 
     logf_(
         "== ChihanaGBK %s (%s) init, exe base %p, encoding=%s, face=%s charset=%d weight=%d hscale=%d",
+
         CHIHANA_VER_STR,
         CHIHANA_BUILD_DATE,
         GetModuleHandleA(NULL),
@@ -1338,6 +1547,7 @@ static void init(void) {
         IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)exe;
 
         if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+
             IMAGE_NT_HEADERS *nt =
                 (IMAGE_NT_HEADERS *)((BYTE *)exe + dos->e_lfanew);
 
@@ -1477,7 +1687,9 @@ static void init(void) {
 
                 /* 保留五個自動 params 欄位。 */
                 for (int i = 0; i < 5; i++) {
+
                     if (sc.site[i]) {
+
                         ok += patch_reader_site(
                             (DWORD)exe + sc.site[i]
                         );
@@ -1510,6 +1722,7 @@ static void init(void) {
             };
 
             for (int i = 0; i < sc.n_close; i++) {
+
                 br += patch_bytes(
                     (DWORD)exe + sc.br_close[i],
                     e1,
@@ -1519,6 +1732,7 @@ static void init(void) {
             }
 
             for (int i = 0; i < sc.n_open; i++) {
+
                 br += patch_bytes(
                     (DWORD)exe + sc.br_open[i],
                     e2,
@@ -1546,6 +1760,7 @@ static void init(void) {
             };
 
             for (int i = 0; i < sc.n_sp1; i++) {
+
                 br += patch_bytes(
                     (DWORD)exe + sc.sp1[i],
                     e3,
@@ -1555,6 +1770,7 @@ static void init(void) {
             }
 
             for (int i = 0; i < sc.n_sp2; i++) {
+
                 br += patch_bytes(
                     (DWORD)exe + sc.sp2[i],
                     e4,
@@ -1630,6 +1846,7 @@ static void init(void) {
                 t;
                 t = strtok(NULL, ", ")
             ) {
+
                 extra += patch_reader_site(
                     (DWORD)strtoul(t, NULL, 0)
                 );
@@ -1638,6 +1855,7 @@ static void init(void) {
 
         logf_(
             "params CP936 hook: 五個自動欄位=%d/5；ExtraSites=%d；標點(】【全形空白): %d 處",
+
             ok,
             extra,
             br
