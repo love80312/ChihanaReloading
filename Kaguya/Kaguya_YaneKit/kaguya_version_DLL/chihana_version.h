@@ -3,7 +3,7 @@
 #define CHIHANA_VER_MAJOR 2
 #define CHIHANA_VER_MINOR 4
 #define CHIHANA_VER_PATCH 1
-#define CHIHANA_VER_BUILD 3
-#define CHIHANA_VER_STR   "2.4.1.3"
+#define CHIHANA_VER_BUILD 4
+#define CHIHANA_VER_STR   "2.4.1.4"
 #define CHIHANA_BUILD_DATE "2026-11-27"
 #endif

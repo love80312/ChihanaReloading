@@ -4,9 +4,9 @@
  *   1. DllMain 不再載入系統 DLL、讀 INI、掃描或修補程式；改由第一次呼叫代理 API 時執行一次初始化。
  *   2. ReaderWrap 改以 FLS 保存每個執行緒的返回位址堆疊，避免共享返回位址。
  *   3. 自動 CP936 hook 恢復套用五個 params 欄位：GameTitle / DisplayTitle / Brand / DefaultFirst / DefaultSecond。
- *   4. EncodingEnabled=0 時略過 CP936 params/GBK 位元組修補；WideCharToMultiByte 仍保留一般 CP932，並保留字型 hook。
+ *   4. EncodingEnabled=0 時不介入文字編碼與 params/GBK 修補，只保留字型 hook。
  *
- * 保留原有字型 hook、一般文字 CP932 fallback、標點與全形空白修補、掃描器簽章及額外 ExtraSites 功能。
+ * EncodingEnabled=1 時完整保留原有 CP932/CP936、標點、全形空白、掃描器及 ExtraSites 功能。
  */
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0600
@@ -26,7 +26,7 @@ static int  g_charset = 134;      /* GB2312_CHARSET */
 static int  g_weight  = 0;        /* 0 = 不改；>0：lfWeight < 400 的字型改成此值 */
 static int  g_hscale  = 100;      /* 字高縮放百分比 */
 static int  g_debug   = 0;
-static int  g_encoding_enabled = 1; /* 1 = CP936/GBK params；0 = 保留 CP932 fallback 與字型 hook */
+static int  g_encoding_enabled = 1; /* 1 = 完整 ChihanaGBK；0 = 原版文字處理，只套用自訂字型 */
 static char g_logpath[MAX_PATH];
 
 #define READER_MAX_DEPTH 128
@@ -192,7 +192,7 @@ DWORD __attribute__((noinline, used)) reader_leave(void) {
 static int WINAPI My_WCTMB(UINT cp, DWORD fl, LPCWSTR ws, int wl, LPSTR s, int sl, LPCSTR dc, LPBOOL ud) {
     UINT in = cp;
     BOOL in_reader = reader_active();
-    if (cp == CP_THREAD_ACP) cp = (g_encoding_enabled && in_reader) ? 936 : 932;
+    if (cp == CP_THREAD_ACP) cp = in_reader ? 936 : 932;
     int r = real_WCTMB(cp, fl, ws, wl, s, sl, dc, ud);
     if (g_debug >= 2 && in_reader && ws) {
         char w[300], o[300]; int n = wl;
@@ -309,11 +309,11 @@ static void init(void) {
     real_LLA = (PFN_LLA)GetProcAddress(k32, "LoadLibraryA");
     logf_("exe IAT: CreateFontIndirectA=%d WideCharToMultiByte=%d LoadLibraryA=%d",
           real_CFIA ? patch_iat(exe, "GDI32.dll", "CreateFontIndirectA", My_CFIA) : 0,
-          real_WCTMB ? patch_iat(exe, "KERNEL32.dll", "WideCharToMultiByte", My_WCTMB) : 0,
+          (g_encoding_enabled && real_WCTMB) ? patch_iat(exe, "KERNEL32.dll", "WideCharToMultiByte", My_WCTMB) : 0,
           real_LLA ? patch_iat(exe, "KERNEL32.dll", "LoadLibraryA", My_LLA) : 0);
     if (!g_encoding_enabled)
-        logf_("EncodingEnabled=0: CP936 params override disabled; CP_THREAD_ACP remains CP932; font hooks remain enabled");
-    if (g_debug >= 2) {
+        logf_("EncodingEnabled=0: original text behavior; no encoding or text-trace hooks; font hooks remain enabled");
+    if (g_encoding_enabled && g_debug >= 2) {
         HMODULE u32 = GetModuleHandleA("user32.dll");
         real_CWEA = (PFN_CWEA)GetProcAddress(u32, "CreateWindowExA"); real_SWTA = (PFN_SWTA)GetProcAddress(u32, "SetWindowTextA");
         logf_("trace: CreateWindowExA=%d SetWindowTextA=%d",
@@ -354,8 +354,8 @@ static void init(void) {
         }
         logf_("params CP936 hook: 五個自動欄位=%d/5；ExtraSites=%d；標點(】【全形空白): %d 處", ok, extra, br);
     } else {
-        /* 日文／字型模式：不掃描、不掛 ReaderWrap、不套用 ExtraSites，也不改任何 GBK 文字位元組；一般 CP932 fallback 仍啟用。 */
-        logf_("EncodingEnabled=0: skipped params scan, CP936 ReaderWrap/ExtraSites and GBK punctuation/full-width-space patches; CP932 fallback and font hooks remain enabled");
+        /* 原版文字模式：不掃描、不掛 ReaderWrap、不套用 ExtraSites，也不修改 GBK 文字位元組。 */
+        logf_("EncodingEnabled=0: skipped text conversion hook, params scan, ReaderWrap/ExtraSites and GBK byte patches; font hooks remain enabled");
     }
 }
 
