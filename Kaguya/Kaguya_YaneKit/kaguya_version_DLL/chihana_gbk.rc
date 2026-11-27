@@ -20,7 +20,7 @@ BEGIN
             VALUE "ProductVersion",   CHIHANA_VER_STR
             VALUE "InternalName",     "version.dll"
             VALUE "OriginalFilename", "version.dll"
-            VALUE "Comments",         "版本 " CHIHANA_VER_STR "（" CHIHANA_BUILD_DATE "）。延後初始化並以執行緒區域狀態包裝 Kaguya params reader；GameTitle、DisplayTitle、Brand、DefaultFirst、DefaultSecond 五個 params 欄位自動使用 GBK(936)，一般資源字串維持 Shift-JIS(932)。保留字型、標點與全形空白修補。"
+            VALUE "Comments",         "版本 " CHIHANA_VER_STR "（" CHIHANA_BUILD_DATE "）。EncodingEnabled=1 時啟用五個 params 欄位 GBK(936)、標點與全形空白修補；設為 0 時略過文字編碼修補但保留字型 hook。一般資源字串維持原系統 ACP。"
             VALUE "LegalCopyright",   "ChihanaGBK 本地化輔助工具，僅供個人學習與本地化使用"
             VALUE "PrivateBuild",     CHIHANA_BUILD_DATE
         END

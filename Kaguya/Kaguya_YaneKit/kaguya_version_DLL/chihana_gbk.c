@@ -4,8 +4,9 @@
  *   1. DllMain 不再載入系統 DLL、讀 INI、掃描或修補程式；改由第一次呼叫代理 API 時執行一次初始化。
  *   2. ReaderWrap 改以 FLS 保存每個執行緒的返回位址堆疊，避免共享返回位址。
  *   3. 自動 CP936 hook 恢復套用五個 params 欄位：GameTitle / DisplayTitle / Brand / DefaultFirst / DefaultSecond。
+ *   4. EncodingEnabled=0 時略過所有 CP936/GBK 文字修補，但保留字型 hook，供日文版只替換字型。
  *
- * 保留原有字型 hook、一般資源字串 ACP 932、標點與全形空白修補、掃描器簽章及額外 ExtraSites 功能。
+ * 保留原有字型 hook、一般資源字串 ACP / CP932、標點與全形空白修補、掃描器簽章及額外 ExtraSites 功能。
  */
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0600
@@ -25,6 +26,7 @@ static int  g_charset = 134;      /* GB2312_CHARSET */
 static int  g_weight  = 0;        /* 0 = 不改；>0：lfWeight < 400 的字型改成此值 */
 static int  g_hscale  = 100;      /* 字高縮放百分比 */
 static int  g_debug   = 0;
+static int  g_encoding_enabled = 1; /* 1 = CP936/GBK 文字處理；0 = 僅保留字型 hook */
 static char g_logpath[MAX_PATH];
 
 #define READER_MAX_DEPTH 128
@@ -190,7 +192,7 @@ DWORD __attribute__((noinline, used)) reader_leave(void) {
 static int WINAPI My_WCTMB(UINT cp, DWORD fl, LPCWSTR ws, int wl, LPSTR s, int sl, LPCSTR dc, LPBOOL ud) {
     UINT in = cp;
     BOOL in_reader = reader_active();
-    if (cp == CP_THREAD_ACP) cp = in_reader ? 936 : 932;
+    if (g_encoding_enabled && cp == CP_THREAD_ACP) cp = in_reader ? 936 : 932;
     int r = real_WCTMB(cp, fl, ws, wl, s, sl, dc, ud);
     if (g_debug >= 2 && in_reader && ws) {
         char w[300], o[300]; int n = wl;
@@ -288,6 +290,7 @@ static void read_ini(void) {
     GetModuleFileNameA(NULL, exe, MAX_PATH);
     char *s = strrchr(exe, '\\'); if (s) *s = 0;
     wsprintfA(ini, "%s\\ChihanaGBK.ini", exe); wsprintfA(g_logpath, "%s\\ChihanaGBK.log", exe);
+    g_encoding_enabled = GetPrivateProfileIntA("Options", "EncodingEnabled", 1, ini) != 0;
     g_debug   = GetPrivateProfileIntA("Options", "Debug", 0, ini);
     GetPrivateProfileStringA("Font", "Face", "SimHei", g_face, LF_FACESIZE, ini);
     g_charset = GetPrivateProfileIntA("Font", "Charset", 134, ini);
@@ -298,7 +301,7 @@ static void read_ini(void) {
 
 static void init(void) {
     read_ini();
-    logf_("== ChihanaGBK %s (%s) init, exe base %p, face=%s charset=%d weight=%d hscale=%d", CHIHANA_VER_STR, CHIHANA_BUILD_DATE, GetModuleHandleA(NULL), g_face, g_charset, g_weight, g_hscale);
+    logf_("== ChihanaGBK %s (%s) init, exe base %p, encoding=%s, face=%s charset=%d weight=%d hscale=%d", CHIHANA_VER_STR, CHIHANA_BUILD_DATE, GetModuleHandleA(NULL), g_encoding_enabled ? "ON" : "OFF", g_face, g_charset, g_weight, g_hscale);
     HMODULE exe = GetModuleHandleA(NULL);
     HMODULE gdi = GetModuleHandleA("gdi32.dll"), k32 = GetModuleHandleA("kernel32.dll");
     real_CFIA = (PFN_CFIA)GetProcAddress(gdi, "CreateFontIndirectA");
@@ -306,8 +309,10 @@ static void init(void) {
     real_LLA = (PFN_LLA)GetProcAddress(k32, "LoadLibraryA");
     logf_("exe IAT: CreateFontIndirectA=%d WideCharToMultiByte=%d LoadLibraryA=%d",
           real_CFIA ? patch_iat(exe, "GDI32.dll", "CreateFontIndirectA", My_CFIA) : 0,
-          real_WCTMB ? patch_iat(exe, "KERNEL32.dll", "WideCharToMultiByte", My_WCTMB) : 0,
+          (g_encoding_enabled && real_WCTMB) ? patch_iat(exe, "KERNEL32.dll", "WideCharToMultiByte", My_WCTMB) : 0,
           real_LLA ? patch_iat(exe, "KERNEL32.dll", "LoadLibraryA", My_LLA) : 0);
+    if (!g_encoding_enabled)
+        logf_("EncodingEnabled=0: CP936 conversion hook disabled; font hooks remain enabled");
     if (g_debug >= 2) {
         HMODULE u32 = GetModuleHandleA("user32.dll");
         real_CWEA = (PFN_CWEA)GetProcAddress(u32, "CreateWindowExA"); real_SWTA = (PFN_SWTA)GetProcAddress(u32, "SetWindowTextA");
@@ -315,38 +320,43 @@ static void init(void) {
               real_CWEA ? patch_iat(exe, "USER32.dll", "CreateWindowExA", My_CWEA) : 0,
               real_SWTA ? patch_iat(exe, "USER32.dll", "SetWindowTextA", My_SWTA) : 0);
     }
-    /* params 讀取點 / 標點：自動掃描 exe 映像。掃描器維持原版，不改動 5.7 / 5.8 已驗證簽章。 */
-    KScan sc; int found = ks_scan((const BYTE *)exe, (DWORD)exe, &sc);
-    int ok = 0, extra = 0, br = 0;
-    if (found) {
-        g_realReader = (DWORD)exe + sc.reader;
-        g_readerFls = FlsAlloc(reader_state_cleanup);
-        if (g_readerFls != FLS_OUT_OF_INDEXES) {
-            /* 恢復 v2.4.0 已驗證的五個 params 欄位 CP936 行為。 */
-            for (int i = 0; i < 5; i++) if (sc.site[i]) ok += patch_reader_site((DWORD)exe + sc.site[i]);
-        } else {
-            logf_("FLS allocation failed: ReaderWrap hook skipped; other patches remain enabled");
+    if (g_encoding_enabled) {
+        /* params 讀取點 / 標點：自動掃描 exe 映像。掃描器維持原版，不改動 5.7 / 5.8 已驗證簽章。 */
+        KScan sc; int found = ks_scan((const BYTE *)exe, (DWORD)exe, &sc);
+        int ok = 0, extra = 0, br = 0;
+        if (found) {
+            g_realReader = (DWORD)exe + sc.reader;
+            g_readerFls = FlsAlloc(reader_state_cleanup);
+            if (g_readerFls != FLS_OUT_OF_INDEXES) {
+                /* 恢復 v2.4.0 已驗證的五個 params 欄位 CP936 行為。 */
+                for (int i = 0; i < 5; i++) if (sc.site[i]) ok += patch_reader_site((DWORD)exe + sc.site[i]);
+            } else {
+                logf_("FLS allocation failed: ReaderWrap hook skipped; other patches remain enabled");
+            }
+            static const BYTE e1[] = {0x81,0x7A}, r1[] = {0xA1,0xBF}, e2[] = {0x81,0x79}, r2[] = {0xA1,0xBE};
+            for (int i = 0; i < sc.n_close; i++) br += patch_bytes((DWORD)exe + sc.br_close[i], e1, r1, 2);
+            for (int i = 0; i < sc.n_open;  i++) br += patch_bytes((DWORD)exe + sc.br_open[i],  e2, r2, 2);
+            /* 全形空白：視窗標題 = GameTitle +「　」+ DisplayTitle；保留原版 GBK 碼修補 */
+            static const BYTE e3[] = {0x81,0x40}, r3[] = {0xA1,0xA1}, e4[] = {0x20,0x81,0x40}, r4[] = {0x20,0xA1,0xA1};
+            for (int i = 0; i < sc.n_sp1; i++) br += patch_bytes((DWORD)exe + sc.sp1[i], e3, r3, 2);
+            for (int i = 0; i < sc.n_sp2; i++) br += patch_bytes((DWORD)exe + sc.sp2[i], e4, r4, 3);
+            logf_("掃描成功: reader=%p (呼叫者 %d), 欄位 %d/5, ReaderWrap CP936 欄位 %d/5, FLS=%s, 】【 %d+%d, 全形空白 %d+%d",
+                  (void *)g_realReader, sc.reader_callers, sc.nsite, ok,
+                  g_readerFls != FLS_OUT_OF_INDEXES ? "OK" : "FAILED",
+                  sc.n_close, sc.n_open, sc.n_sp1, sc.n_sp2);
+        } else logf_("掃描不到 params reader（可能不是此引擎版本）：略過標題/括號修補");
+        /* 手動補充：ini [Params] ExtraSites=0x...,0x...（reader 呼叫位址；明確設定時額外套用 CP936） */
+        if (found && g_readerFls != FLS_OUT_OF_INDEXES) {
+            char ini[MAX_PATH], exep[MAX_PATH]; GetModuleFileNameA(NULL, exep, MAX_PATH); char *s2 = strrchr(exep, '\\'); if (s2) *s2 = 0;
+            wsprintfA(ini, "%s\\ChihanaGBK.ini", exep);
+            char list[256]; GetPrivateProfileStringA("Params", "ExtraSites", "", list, sizeof list, ini);
+            for (char *t = strtok(list, ", "); t; t = strtok(NULL, ", ")) extra += patch_reader_site((DWORD)strtoul(t, NULL, 0));
         }
-        static const BYTE e1[] = {0x81,0x7A}, r1[] = {0xA1,0xBF}, e2[] = {0x81,0x79}, r2[] = {0xA1,0xBE};
-        for (int i = 0; i < sc.n_close; i++) br += patch_bytes((DWORD)exe + sc.br_close[i], e1, r1, 2);
-        for (int i = 0; i < sc.n_open;  i++) br += patch_bytes((DWORD)exe + sc.br_open[i],  e2, r2, 2);
-        /* 全形空白：視窗標題 = GameTitle +「　」+ DisplayTitle；保留原版 GBK 碼修補 */
-        static const BYTE e3[] = {0x81,0x40}, r3[] = {0xA1,0xA1}, e4[] = {0x20,0x81,0x40}, r4[] = {0x20,0xA1,0xA1};
-        for (int i = 0; i < sc.n_sp1; i++) br += patch_bytes((DWORD)exe + sc.sp1[i], e3, r3, 2);
-        for (int i = 0; i < sc.n_sp2; i++) br += patch_bytes((DWORD)exe + sc.sp2[i], e4, r4, 3);
-        logf_("掃描成功: reader=%p (呼叫者 %d), 欄位 %d/5, ReaderWrap CP936 欄位 %d/5, FLS=%s, 】【 %d+%d, 全形空白 %d+%d",
-              (void *)g_realReader, sc.reader_callers, sc.nsite, ok,
-              g_readerFls != FLS_OUT_OF_INDEXES ? "OK" : "FAILED",
-              sc.n_close, sc.n_open, sc.n_sp1, sc.n_sp2);
-    } else logf_("掃描不到 params reader（可能不是此引擎版本）：略過標題/括號修補");
-    /* 手動補充：ini [Params] ExtraSites=0x...,0x...（reader 呼叫位址；明確設定時額外套用 CP936） */
-    if (found && g_readerFls != FLS_OUT_OF_INDEXES) {
-        char ini[MAX_PATH], exep[MAX_PATH]; GetModuleFileNameA(NULL, exep, MAX_PATH); char *s2 = strrchr(exep, '\\'); if (s2) *s2 = 0;
-        wsprintfA(ini, "%s\\ChihanaGBK.ini", exep);
-        char list[256]; GetPrivateProfileStringA("Params", "ExtraSites", "", list, sizeof list, ini);
-        for (char *t = strtok(list, ", "); t; t = strtok(NULL, ", ")) extra += patch_reader_site((DWORD)strtoul(t, NULL, 0));
+        logf_("params CP936 hook: 五個自動欄位=%d/5；ExtraSites=%d；標點(】【全形空白): %d 處", ok, extra, br);
+    } else {
+        /* 純字型模式：不掃描、不掛 ReaderWrap、不套用 ExtraSites，也不改任何 GBK 文字位元組。 */
+        logf_("EncodingEnabled=0: skipped params scan, CP936 ReaderWrap/ExtraSites and GBK punctuation/full-width-space patches; font hook remains enabled");
     }
-    logf_("params CP936 hook: 五個自動欄位=%d/5；ExtraSites=%d；標點(】【全形空白): %d 處", ok, extra, br);
 }
 
 /* InitOnce 確保多執行緒首次呼叫代理 API 時，只初始化一次。此處已離開本 DLL 的 DllMain。 */
